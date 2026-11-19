@@ -171,6 +171,8 @@ class RotateOptions(BaseOptions):
     """The (RA, Dec) in degrees that the Q and U of every input are referenced to north at, such as the boresight of an ASKAP observation, with ``input_frame="reference"``"""
     suffix: str = "rot"
     """Suffix inserted before ``.fits`` in the names of rotated images"""
+    reverse_rotation: bool = False
+    """Turn Q and U the opposite way, by minus the angle between the frame of each input and north at each pixel. This is for testing the direction of the rotation, such as where the angles of overlapping fields disagree. The outputs still record that they are referenced to north at each pixel, and their HISTORY that the rotation was reversed"""
 
 
 class MosaicOptions(NamedTuple):

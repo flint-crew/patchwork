@@ -86,6 +86,7 @@ def rotate_pair(
     suffix: str = "rot",
     overwrite: bool = False,
     threads: int = 1,
+    reverse_rotation: bool = False,
 ) -> tuple[Path, Path]:
     """Rotate the Q and U of one input from north at ``centre`` to north at each pixel, writing new images.
 
@@ -93,6 +94,11 @@ def rotate_pair(
     referenced to north at ``centre`` and the mosaic to north at each pixel.
     The outputs copy the headers of the inputs, record the new frame in their
     POLFRAME keywords, and are float32.
+
+    With ``reverse_rotation`` each pixel is turned by the same angle the
+    opposite way, to test the direction of the rotation. The outputs are then
+    not what ``patchwork mosaic`` would make, but record the same frame, and
+    their HISTORY says that the rotation was reversed.
 
     Args:
         q_path (str | Path): The Stokes Q image or cube
@@ -103,6 +109,7 @@ def rotate_pair(
         suffix (str, optional): The suffix of outputs that are not named. Defaults to "rot".
         overwrite (bool, optional): Replace existing outputs. Defaults to False.
         threads (int, optional): Threads that rotate blocks of rows at once; 0 uses every CPU. Defaults to 1.
+        reverse_rotation (bool, optional): Turn Q and U by minus the angle. Defaults to False.
 
     Raises:
         ValueError: Raised if the two images are not on one grid
@@ -130,6 +137,8 @@ def rotate_pair(
             f"Rotated by patchwork {__version__} from north at RA {centre[0]:.5f}, "
             f"Dec {centre[1]:.5f} to north at each pixel"
         )
+        if reverse_rotation:
+            header["HISTORY"] = "The rotation was reversed, to test its direction"
         create_output_fits(output, header, _output_beams(info))
 
     ny, nx = q_info.shape
@@ -138,8 +147,8 @@ def rotate_pair(
     threads = tile_threads(threads)
     logger.info(
         f"Rotating {q_path} and {u_path} from north at RA {centre[0]:.5f}, Dec {centre[1]:.5f} "
-        f"to north at each pixel: {q_info.n_channels} channels in {len(blocks)} blocks of rows "
-        f"on {threads} threads"
+        f"to north at each pixel{', with the rotation reversed' if reverse_rotation else ''}: "
+        f"{q_info.n_channels} channels in {len(blocks)} blocks of rows on {threads} threads"
     )
     with (
         fits.open(outputs[0], mode="update", memmap=True) as q_hdul,
@@ -158,6 +167,8 @@ def rotate_pair(
             started = time.perf_counter()
             region = (block, slice(0, nx))
             angle = frame_angle(centre, tile_coordinates(q_info.wcs, region).vectors)
+            if reverse_rotation:
+                angle = -angle
             q, u = rotate_linear(
                 np.asarray(read_block(q_path, region), dtype=np.float64),
                 np.asarray(read_block(u_path, region), dtype=np.float64),
@@ -246,6 +257,12 @@ def rotate_cubes(
         u_path = item.planes[item.stokes.index(STOKES_CODES["U"])]
         pairs.append((q_path, u_path, centre))
 
+    if options.reverse_rotation:
+        logger.warning(
+            "The rotation is reversed, to test its direction: the outputs record that they "
+            "are referenced to north at each pixel, but are turned the opposite way to the "
+            "rotation patchwork mosaic applies"
+        )
     outputs: dict[Path, Path] = {}
     for q_path, u_path, centre in pairs:
         outputs[q_path], outputs[u_path] = rotate_pair(
@@ -255,6 +272,7 @@ def rotate_cubes(
             suffix=options.suffix,
             overwrite=overwrite,
             threads=threads,
+            reverse_rotation=options.reverse_rotation,
         )
     return [outputs[info.path] for info in infos]
 

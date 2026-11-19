@@ -98,6 +98,49 @@ def test_rotation_recovers_the_sky(tmp_path: Path) -> None:
     assert angle_error_deg(got[bright], turned[bright]) < 1e-3
 
 
+def test_reverse_rotation_turns_the_other_way(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """--reverse-rotation turns Q and U by minus the frame angle, and says so in the log and in the HISTORY of the outputs."""
+    centre, boresight = (30.0, -88.5), (0.0, -89.0)
+    q_path, u_path = write_polarised_beam(tmp_path, "beam", centre, boresight)
+    usual = rotate_cubes([q_path, u_path], RotateOptions(frame_centre=boresight))
+    with caplog.at_level("WARNING", logger="patchwork"):
+        cli(
+            get_parser().parse_args(
+                [
+                    str(q_path),
+                    str(u_path),
+                    "--frame-centre",
+                    str(boresight[0]),
+                    str(boresight[1]),
+                    "--reverse-rotation",
+                    "--suffix",
+                    "reversed",
+                ]
+            )
+        )
+    assert "The rotation is reversed" in caplog.text
+    reverse = (rotated_name(q_path, "reversed"), rotated_name(u_path, "reversed"))
+
+    original, header = read_complex(q_path, u_path)
+    y, x = np.mgrid[: original.shape[0], : original.shape[1]]
+    ra, dec = celestial_wcs(header).pixel_to_world_values(x, y)
+    angle = frame_angle(boresight, unit_vectors(ra, dec))
+    bright = np.abs(original) > 0.1 * np.nanmax(np.abs(original))
+    got, got_header = read_complex(*reverse)
+    turned_back = original * np.exp(-2j * angle)
+    assert angle_error_deg(got[bright], turned_back[bright]) < 1e-3
+    assert np.allclose(np.abs(got[bright]), np.abs(original[bright]), rtol=1e-5)
+
+    # Twice the frame angle from the usual rotation, which is large this close to the pole
+    forward, forward_header = read_complex(*usual)
+    assert angle_error_deg(got[bright], forward[bright]) > 5
+    assert got_header["POLFRAME"] == "NORTH"
+    assert any("rotation was reversed" in card for card in got_header["HISTORY"])
+    assert not any("reversed" in card for card in forward_header["HISTORY"])
+
+
 def test_rotated_cubes_record_their_frame_and_keep_their_beams(tmp_path: Path) -> None:
     """The outputs say they are north at each pixel, keep the beam of every channel, and are float32 of the input's shape."""
     beams = tuple(BeamShape(36.0 + channel, 30.0, 10.0) for channel in range(5))

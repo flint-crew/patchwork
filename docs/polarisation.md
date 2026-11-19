@@ -162,6 +162,18 @@ A mosaic of rotated images differs from one of the originals rotated in flight
 only by the rounding of float32 and the 0.001 pixel tolerance of the
 interpolated coordinates on each grid: about 1e-5 radians of angle near a pole.
 
+`--reverse-rotation` (`reverse_rotation`) turns every pixel by the same angle
+the opposite way. It is for testing the direction of the rotation: for example,
+where the angles of overlapping fields disagree, rotate both with it and compare
+them again. The outputs still carry `POLFRAME NORTH`, so they mosaic without
+frame options, and their `HISTORY` records that the rotation was reversed. Give
+them their own `--suffix`, so they are not mistaken for the usual outputs.
+
+```bash
+patchwork rotate beam*.{q,u}.cube.fits --frame-centre 12.5 -81.0 \
+    --reverse-rotation --suffix reversed
+```
+
 ## Frame keywords
 
 patchwork records the frame of a mosaic's Q and U in the headers of its Q and U
