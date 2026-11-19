@@ -12,7 +12,6 @@ from astropy.io import fits
 from distributed import Client, LocalCluster
 
 import patchwork.mosaic
-import patchwork.resample
 import patchwork.write
 from patchwork.convolve import convolve_cube
 from patchwork.coordinates import unit_vectors
@@ -621,7 +620,8 @@ def test_noise_is_measured_with_the_tile_threads(
         return measure_channel_weights(path, **kwargs)
 
     monkeypatch.setattr(patchwork.mosaic, "measure_channel_weights", recording)
-    monkeypatch.setattr(patchwork.resample, "available_cpus", lambda: 12)
+    # mosaic shares the CPUs between its workers under the name it imported
+    monkeypatch.setattr(patchwork.mosaic, "available_cpus", lambda: 12)
     options = cube_options_for_test(
         resample=ResampleOptions(backend="numpy", tile_threads=0, tile_size=64)
     )

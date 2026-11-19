@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from collections.abc import Callable
 from pathlib import Path
 
@@ -12,6 +13,14 @@ from numpy.typing import NDArray
 
 from patchwork.io import celestial_wcs
 from patchwork.primary_beam import direction_cosines, gaussian_beam
+from patchwork.resample import available_cpus
+
+# numba starts a thread for each CPU the process may run on, and the tests of
+# the fused backend make tiles with up to 3. On a smaller machine, such as a CI
+# runner with 2 CPUs, numba is told to start 4. Nothing above imports numba,
+# which reads this when it is imported.
+if available_cpus() < 4:
+    os.environ.setdefault("NUMBA_NUM_THREADS", "4")
 
 FREQUENCY_HZ = 9.4e8
 
