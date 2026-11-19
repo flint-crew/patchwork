@@ -1,0 +1,13 @@
+# Changes here will be overwritten by Copier; NEVER EDIT MANUALLY
+_commit: 2025.11.21-25-gad4434f
+_src_path: gh:scientific-python/cookie
+backend: hatch
+docs: sphinx
+email: tim.galvin@csiro.au
+full_name: Tim Galvin
+license: BSD
+org: flint-crew
+project_name: askap-patchwork
+project_short_description: The pirate quilt.
+url: https://github.com/flint-crew/patchwork
+vcs: true
