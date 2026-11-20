@@ -14,7 +14,7 @@
 [pypi-link]:                https://pypi.org/project/askap-patchwork/
 [pypi-platforms]:           https://img.shields.io/pypi/pyversions/askap-patchwork
 [pypi-version]:             https://img.shields.io/pypi/v/askap-patchwork
-[rtd-badge]:                https://readthedocs.org/projects/patchwork/badge/?version=latest
+[rtd-badge]:                https://readthedocs.org/projects/askap-patchwork/badge/?version=latest
 [rtd-link]:                 https://askap-patchwork.readthedocs.io/en/latest/?badge=latest
 [coverage-badge]:           https://codecov.io/github/flint-crew/patchwork/branch/main/graph/badge.svg
 [coverage-link]:            https://codecov.io/github/flint-crew/patchwork
@@ -35,7 +35,8 @@ on a dask cluster.
 
 ## Documentation
 
-The documentation is on [Read the Docs](https://askap-patchwork.readthedocs.io/).
+The documentation is on
+[Read the Docs](https://askap-patchwork.readthedocs.io/).
 
 ## Usage
 
