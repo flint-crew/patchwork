@@ -14,13 +14,15 @@ process is the one that runs `patchwork-pipeline`, or calls `run_pipeline`.
 4. The images are grouped into beams, and the frame and inputs of the mosaic are
    prepared (`patchwork.plan.plan_mosaic`).
 5. Each tile is made on a worker (`patchwork.tile.mosaic_tile`). For FITS
-   output, the main process writes each tile as it arrives, so only one process
-   writes the files, unless `--fits-writer workers` is given (see below). For
-   zarr output, the workers write the tiles. When the main process writes, no
-   more than `--tasks-in-flight` tiles are made at once, by default twice the
-   number of threads in the cluster, which is checked again as the cluster
-   scales, so it holds no more than that many tiles however far ahead of it the
-   workers are. When the workers write, every tile is queued at once unless
+   output, the main process gathers the tiles as they arrive and writes each
+   band of them, a row of tiles across the frame, once it is whole, so only one
+   process writes the files, unless `--fits-writer workers` is given (see
+   below). For zarr output, the workers write the tiles. When the main process
+   writes, no more than `--tasks-in-flight` tiles are made at once, by default
+   twice the number of threads in the cluster, which is checked again as the
+   cluster scales, so it holds no more than that many tiles however far ahead of
+   it the workers are, besides the bands it gathers (up to `--fits-buffer-mb`).
+   When the workers write, every tile is queued at once unless
    `--tasks-in-flight` is given. The number of tiles finished is logged every 30
    seconds, with an estimate of the time remaining.
 6. If a noise image is requested, it is written from the weights. Otherwise each
@@ -128,16 +130,24 @@ run_options = RunOptions(fits_writer="workers")
 ## Writing FITS from the workers
 
 By default every tile of a FITS mosaic is sent to the main process, which writes
-it. It writes a tile one row of each channel at a time, and on a shared file
-system each of those small writes waits for the file system. On a cluster this
-is slower than making the tiles, so the workers end up waiting for the main
-process: in a test on Lustre with 32 workers, a mosaic the main process wrote
-took about ten times as long as one the workers wrote themselves. With
-`--fits-writer workers` (`fits_writer="workers"`), each task writes its own part
-of the FITS files and returns nothing to the main process. On a file system
-where several machines cannot write one file, such as NFS, write zarr instead
-(`--output-format zarr`, see [cubes](cubes.md)), which is about as fast. Leave
-the writing to the main process only on one machine.
+it. Each row of a tile is a short run of bytes in a file, and on a shared file
+system such as Lustre a short write takes about as long as a long one. So the
+main process gathers the tiles of each band, a row of tiles across the frame,
+and writes the band once all its tiles have arrived, as one run of bytes for
+each channel of each file. On Lustre, 4 GB written this way took 6 s; written a
+tile row at a time it took 3 minutes, and through a memory map, as patchwork
+0.1.0 wrote it, 8 to 10 minutes. The bands are held in memory, up to
+`--fits-buffer-mb` (4096 MB by default). A band takes
+`tile_size x frame width x channel_chunk x 4` bytes for each image and weight,
+and the tiles of a band that does not fit are written a row at a time. Every
+tile still passes through the main process, so on a large cluster the workers
+can wait for it: in a test on Lustre with 32 workers, with patchwork 0.1.0, a
+mosaic the main process wrote took about ten times as long as one the workers
+wrote themselves. With `--fits-writer workers` (`fits_writer="workers"`), each
+task writes its own part of the FITS files and returns nothing to the main
+process. On a file system where several machines cannot write one file, such as
+NFS, write zarr instead (`--output-format zarr`, see [cubes](cubes.md)), which
+is about as fast. Leave the writing to the main process only on one machine.
 
 The main process creates the files, without data, and finds where the data of
 each begins. The frame is divided into strips of whole rows, each about the size
@@ -185,10 +195,11 @@ def task_mosaic(images, output_base):
 ```
 
 - The task is the main process of the mosaic. For FITS output it receives and
-  writes every tile, so its worker holds up to `tasks_in_flight` tiles. Each
-  tile is about `channel_chunk x tile_size^2 x 4` bytes for each output image
-  and weight: 84 MB for 512² tiles over 16 channels of I, Q and U. Set
-  `tasks_in_flight` to fit the memory of that worker, or on Lustre have the
+  writes every tile, so its worker holds up to `tasks_in_flight` tiles, and the
+  bands of tiles it gathers, up to `fits_buffer_mb`. Each tile is about
+  `channel_chunk x tile_size^2 x 4` bytes for each output image and weight: 84
+  MB for 512² tiles over 16 channels of I, Q and U. Set `tasks_in_flight` and
+  `fits_buffer_mb` to fit the memory of that worker, or on Lustre have the
   workers write the files (`fits_writer="workers"`), in which case the task
   receives no tiles.
 - The task keeps its worker thread while it waits for the tiles, so the cluster
