@@ -8,10 +8,11 @@ beam areas.
 
 from __future__ import annotations
 
+import importlib
 from argparse import ArgumentParser, Namespace
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 import numpy as np
 import scipy.fft
@@ -36,7 +37,20 @@ from patchwork.logging import logger, setup_logging
 from patchwork.options import ConvolveOptions
 
 if TYPE_CHECKING:
+    from types import ModuleType
+
     from numpy.typing import NDArray
+
+ConvolveBackend = Literal["scipy", "rust"]
+
+
+def convolve_rs() -> ModuleType:
+    """The convolve-rs module, or an error that says how to install it."""
+    try:
+        return importlib.import_module("convolve_rs")
+    except ImportError as error:
+        msg = "The rust backend needs convolve-rs, which is installed with `pip install askap-patchwork[rust]`"
+        raise ImportError(msg) from error
 
 
 def beam_covariance(beam: BeamShape) -> NDArray[np.float64]:
@@ -53,6 +67,18 @@ def beam_covariance(beam: BeamShape) -> NDArray[np.float64]:
     )
 
 
+def beam_from_covariance(covariance: NDArray[np.float64]) -> BeamShape:
+    """The beam with a covariance in degrees squared along (east, north), as ``beam_covariance`` gives."""
+    eigenvalues, eigenvectors = np.linalg.eigh(covariance)
+    sigma_to_fwhm = np.sqrt(8 * np.log(2)) * 3600
+    east, north = eigenvectors[:, 1]
+    return BeamShape(
+        bmaj_arcsec=float(np.sqrt(eigenvalues[1]) * sigma_to_fwhm),
+        bmin_arcsec=float(np.sqrt(max(eigenvalues[0], 0.0)) * sigma_to_fwhm),
+        bpa_deg=float(np.degrees(np.arctan2(east, north))),
+    )
+
+
 def _round_up(value: float, decimals: int) -> float:
     """Round up to a number of decimal places."""
     return float(np.ceil(value * 10**decimals) / 10**decimals)
@@ -66,6 +92,7 @@ def common_beam(
     nsamps: int = 200,
     epsilon: float = 5e-4,
     name: str | None = None,
+    backend: ConvolveBackend = "scipy",
 ) -> BeamShape:
     """The smallest beam that encloses every usable beam, rounded up as racs-tools does.
 
@@ -81,6 +108,7 @@ def common_beam(
         nsamps (int, optional): Number of samples of the common beam search. Defaults to 200.
         epsilon (float, optional): Epsilon of the common beam search. Defaults to 5e-4.
         name (str | None, optional): What the beams are of, such as a channel, for the log. Defaults to None.
+        backend (ConvolveBackend, optional): Find the beam with radio_beam (scipy) or with convolve-rs (rust). Defaults to "scipy".
 
     Raises:
         ValueError: Raised when no beam is usable
@@ -99,18 +127,22 @@ def common_beam(
         msg = f"None of the {len(beams)} beams is usable"
         raise ValueError(msg)
 
-    radio_beams = Beams(beams=[beam.to_radio_beam() for beam in usable])
-    try:
-        found = radio_beams.common_beam(
-            tolerance=tolerance, nsamps=nsamps, epsilon=epsilon
-        )
-    except BeamError:
-        logger.warning(f"Retrying the common beam search with {tolerance=:.1g} / 10")
-        found = radio_beams.common_beam(
-            tolerance=tolerance * 0.1, nsamps=nsamps, epsilon=epsilon
-        )
-
-    found_shape = BeamShape.from_radio_beam(found)
+    if backend == "rust":
+        found_shape = _rust_common_beam(usable, tolerance, nsamps, epsilon)
+    else:
+        radio_beams = Beams(beams=[beam.to_radio_beam() for beam in usable])
+        try:
+            found = radio_beams.common_beam(
+                tolerance=tolerance, nsamps=nsamps, epsilon=epsilon
+            )
+        except BeamError:
+            logger.warning(
+                f"Retrying the common beam search with {tolerance=:.1g} / 10"
+            )
+            found = radio_beams.common_beam(
+                tolerance=tolerance * 0.1, nsamps=nsamps, epsilon=epsilon
+            )
+        found_shape = BeamShape.from_radio_beam(found)
     bmaj = _round_up(found_shape.bmaj_arcsec, decimals=1)
     shape = BeamShape(
         bmaj_arcsec=bmaj,
@@ -132,12 +164,27 @@ def common_beam(
     return shape
 
 
+def _rust_common_beam(
+    beams: list[BeamShape], tolerance: float, nsamps: int, epsilon: float
+) -> BeamShape:
+    """The unrounded common beam convolve-rs finds, retried as radio_beam's is."""
+    cr = convolve_rs()
+    rust_beams = [cr.Beam.from_arcsec(*beam) for beam in beams]
+    try:
+        found = cr.common_beam(rust_beams, tolerance, nsamps, epsilon)
+    except ValueError:
+        logger.warning(f"Retrying the common beam search with {tolerance=:.1g} / 10")
+        found = cr.common_beam(rust_beams, tolerance * 0.1, nsamps, epsilon)
+    return BeamShape(found.major_arcsec, found.minor_arcsec, found.pa_deg)
+
+
 def convolve_to_beam(
     image: NDArray[np.floating],
     old_beam: BeamShape,
     new_beam: BeamShape,
     pixel_scale_matrix: NDArray[np.float64],
     cutoff_arcsec: float | None = None,
+    backend: ConvolveBackend = "scipy",
 ) -> NDArray[np.floating]:
     """Convolve an image in Jy/beam from its restoring beam to a larger one.
 
@@ -150,6 +197,7 @@ def convolve_to_beam(
         new_beam (BeamShape): The beam to convolve to
         pixel_scale_matrix (NDArray[np.float64]): Degrees (east, north) per (x, y) pixel, e.g. ``WCS.pixel_scale_matrix``
         cutoff_arcsec (float | None, optional): Blank the whole image if its beam major axis is larger than this. Defaults to None.
+        backend (ConvolveBackend, optional): Convolve with scipy or with convolve-rs (rust). Defaults to "scipy".
 
     Raises:
         ValueError: Raised if the new beam does not enclose the old beam
@@ -182,6 +230,7 @@ def convolve_to_beam(
     if np.min(eigenvalues) < -1e-3 * old_size:
         msg = f"Cannot convolve {old_beam} to {new_beam}, which does not enclose it"
         raise ValueError(msg)
+    clipped = np.min(eigenvalues) < 0
     eigenvalues = np.clip(eigenvalues, 0, None)
     difference = eigenvectors @ np.diag(eigenvalues) @ eigenvectors.T
 
@@ -199,6 +248,35 @@ def convolve_to_beam(
     area_ratio = (new_beam.bmaj_arcsec * new_beam.bmin_arcsec) / (
         old_beam.bmaj_arcsec * old_beam.bmin_arcsec
     )
+
+    if backend == "rust":
+        # The kernel clipped above is passed as the beam it gives the image
+        target = (
+            beam_from_covariance(
+                beam_covariance(old_beam)
+                + pixel_scale_matrix @ difference @ pixel_scale_matrix.T
+            )
+            if clipped
+            else new_beam
+        )
+        padded_image = np.zeros(padded, dtype=real_dtype)
+        padded_image[:ny, :nx] = image
+        padded_image[~np.isfinite(padded_image)] = np.nan
+        cr = convolve_rs()
+        convolved = cr.smooth(
+            padded_image,
+            cr.Beam.from_arcsec(*old_beam),
+            cr.Beam.from_arcsec(*target),
+            pixel_scale_matrix=np.asarray(pixel_scale_matrix).tolist(),
+            bunit="K",
+            nan_fraction=0.5,
+        )[:ny, :nx]
+        convolved *= area_ratio
+        if not np.all(np.isfinite(image)):
+            logger.info(
+                f"Blanked {np.mean(np.isnan(convolved)):.1%} of the convolved image"
+            )
+        return np.asarray(convolved, dtype=image.dtype)
 
     # Images can be large, so each plane-sized array is made once and worked on in
     # place. The taper carries the ratio of the beam areas
@@ -252,6 +330,7 @@ def convolve_fits(
     suffix: str = "conv",
     cutoff_arcsec: float | None = None,
     overwrite: bool = False,
+    backend: ConvolveBackend = "scipy",
 ) -> Path:
     """Convolve a FITS image to a beam, writing a float32 image with the new beam in its header.
 
@@ -264,6 +343,7 @@ def convolve_fits(
         suffix (str, optional): Suffix of the default output name. Defaults to "conv".
         cutoff_arcsec (float | None, optional): Blank the image if its beam major axis is larger than this. Defaults to None.
         overwrite (bool, optional): Replace an existing output. Defaults to False.
+        backend (ConvolveBackend, optional): Convolve with scipy or with convolve-rs (rust). Defaults to "scipy".
 
     Raises:
         ValueError: Raised if the image has no usable restoring beam
@@ -293,6 +373,7 @@ def convolve_fits(
         new_beam=beam,
         pixel_scale_matrix=celestial_wcs(header).pixel_scale_matrix,
         cutoff_arcsec=cutoff_arcsec,
+        backend=backend,
     )
     blanked = cutoff_arcsec is not None and old_beam.bmaj_arcsec > cutoff_arcsec
     (BeamShape(0.0, 0.0, 0.0) if blanked else beam).to_header(header)
@@ -335,6 +416,7 @@ def convolve_images(
             suffix=options.suffix,
             cutoff_arcsec=options.beam_cutoff_arcsec,
             overwrite=overwrite,
+            backend=options.convolve_backend,
         )
         for image in images
     ]
@@ -352,6 +434,7 @@ def target_beam(images: list[Path], options: ConvolveOptions) -> BeamShape:
         tolerance=options.tolerance,
         nsamps=options.nsamps,
         epsilon=options.epsilon,
+        backend=options.convolve_backend,
     )
 
 
@@ -392,6 +475,7 @@ def channel_target_beams(
                 nsamps=options.nsamps,
                 epsilon=options.epsilon,
                 name=name,
+                backend=options.convolve_backend,
             )
         except ValueError as error:
             logger.info(f"Leaving {name or 'the images'} blank: {error}")
@@ -429,6 +513,7 @@ def convolve_cube(
     overwrite: bool = False,
     channels: slice | None = None,
     threads: int = 1,
+    backend: ConvolveBackend = "scipy",
 ) -> Path:
     """Convolve some channels of a cube to their beams, a channel at a time in each of ``threads`` threads.
 
@@ -449,6 +534,7 @@ def convolve_cube(
         overwrite (bool, optional): Replace an existing output. Defaults to False.
         channels (slice | None, optional): The channels to convolve. Defaults to None, every channel.
         threads (int, optional): Threads that each convolve a channel at a time. Defaults to 1.
+        backend (ConvolveBackend, optional): Convolve with scipy or with convolve-rs (rust). Defaults to "scipy".
 
     Returns:
         Path: The convolved cube
@@ -491,7 +577,9 @@ def convolve_cube(
                 )
                 return
             plane = read_block(path, channels=channel_slice, dtype=np.float32)[0]
-            convolved = convolve_to_beam(plane, old, new, pixel_scale_matrix)
+            convolved = convolve_to_beam(
+                plane, old, new, pixel_scale_matrix, backend=backend
+            )
             write_block(hdu, (slice(None), slice(None)), convolved[None], channel_slice)
 
         if threads > 1 and len(selected) > 1:

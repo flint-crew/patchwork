@@ -35,7 +35,12 @@ from typing import TYPE_CHECKING, Any, Literal
 
 from capn_crunch import add_options_to_parser, create_options_from_parser
 
-from patchwork.convolve import channel_target_beams, convolve_cube, convolved_name
+from patchwork.convolve import (
+    ConvolveBackend,
+    channel_target_beams,
+    convolve_cube,
+    convolved_name,
+)
 from patchwork.io import BeamShape, check_output_fits, read_image_info
 from patchwork.logging import logger, setup_logging
 from patchwork.options import (
@@ -314,6 +319,7 @@ def mosaic(
                     overwrite,
                     channels,
                     options.resample.tile_threads,
+                    convolve_options.convolve_backend,
                 ),
             )
             for info, output in zip(to_convolve, outputs, strict=True)
@@ -400,6 +406,7 @@ def _convolve_cube(
     overwrite: bool,
     channels: slice | None,
     threads: int,
+    backend: ConvolveBackend,
 ) -> Path:
     """Convolve a cube in the threads a tile would be made with, resolved where it runs, as ``_measure_weights`` does."""
     return convolve_cube(
@@ -410,6 +417,7 @@ def _convolve_cube(
         overwrite,
         channels,
         threads=tile_threads(threads),
+        backend=backend,
     )
 
 

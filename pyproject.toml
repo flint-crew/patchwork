@@ -40,6 +40,7 @@ dependencies = [
 
 [project.optional-dependencies]
 numba = ["numba>=0.61"]
+rust = ["convolve-rs>=2.4.0"]
 zarr = ["zarr>=3"]
 
 [project.urls]
@@ -56,7 +57,7 @@ patchwork-cube = "patchwork.pipeline.flow:cli"
 
 
 [dependency-groups]
-test = ["pytest >=9", "pytest-cov >=7", "numba>=0.61", "zarr>=3"]
+test = ["pytest >=9", "pytest-cov >=7", "numba>=0.61", "zarr>=3", "convolve-rs>=2.4.0"]
 dev = [
     { include-group = "test" },
     "mypy>=1.19.1",

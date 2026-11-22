@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+import importlib.util
+import sys
+from typing import TYPE_CHECKING, cast
 
 import numpy as np
 import pytest
@@ -9,6 +11,7 @@ from astropy.wcs import WCS
 
 from patchwork.convolve import (
     beam_covariance,
+    beam_from_covariance,
     cli,
     common_beam,
     convolve_fits,
@@ -24,6 +27,18 @@ from .conftest import image_header
 
 if TYPE_CHECKING:
     from pathlib import Path
+
+    from patchwork.convolve import ConvolveBackend
+
+BACKENDS: tuple[ConvolveBackend, ...] = ("scipy", "rust")
+has_convolve_rs = importlib.util.find_spec("convolve_rs") is not None
+needs_convolve_rs = pytest.mark.skipif(not has_convolve_rs, reason="needs convolve-rs")
+
+
+@pytest.fixture(params=["scipy", pytest.param("rust", marks=needs_convolve_rs)])
+def backend(request: pytest.FixtureRequest) -> ConvolveBackend:
+    """Each convolution backend."""
+    return cast("ConvolveBackend", request.param)
 
 
 def sky_wcs(cdelt1_sign: int = -1, rotation_deg: float = 0.0) -> WCS:
@@ -59,21 +74,26 @@ def point_sources(wcs: WCS, shape: tuple[int, int], beam: BeamShape) -> np.ndarr
 @pytest.mark.parametrize(
     ("cdelt1_sign", "rotation_deg"), [(-1, 0.0), (1, 0.0), (-1, 25.0)]
 )
-def test_convolve_matches_drawn_beam(cdelt1_sign: int, rotation_deg: float) -> None:
+def test_convolve_matches_drawn_beam(
+    cdelt1_sign: int, rotation_deg: float, backend: ConvolveBackend
+) -> None:
     wcs = sky_wcs(cdelt1_sign, rotation_deg)
     old, new = BeamShape(12, 8, 30), BeamShape(25, 15, -50)
     image = point_sources(wcs, (256, 256), old).astype(np.float32)
-    convolved = convolve_to_beam(image, old, new, wcs.pixel_scale_matrix)
+    convolved = convolve_to_beam(
+        image, old, new, wcs.pixel_scale_matrix, backend=backend
+    )
     assert convolved.dtype == np.float32
     assert np.max(np.abs(convolved - point_sources(wcs, (256, 256), new))) < 1e-4
 
 
-def test_convolve_identity_and_cutoff() -> None:
+def test_convolve_identity_and_cutoff(backend: ConvolveBackend) -> None:
     wcs = sky_wcs()
     beam = BeamShape(12, 8, 30)
     image = point_sources(wcs, (64, 64), beam)
     assert np.array_equal(
-        convolve_to_beam(image, beam, beam, wcs.pixel_scale_matrix), image
+        convolve_to_beam(image, beam, beam, wcs.pixel_scale_matrix, backend=backend),
+        image,
     )
     assert np.all(
         np.isnan(
@@ -83,25 +103,36 @@ def test_convolve_identity_and_cutoff() -> None:
                 BeamShape(20, 20, 0),
                 wcs.pixel_scale_matrix,
                 cutoff_arcsec=10,
+                backend=backend,
             )
         )
     )
     with pytest.raises(ValueError, match="does not enclose"):
-        convolve_to_beam(image, BeamShape(20, 20, 0), beam, wcs.pixel_scale_matrix)
+        convolve_to_beam(
+            image,
+            BeamShape(20, 20, 0),
+            beam,
+            wcs.pixel_scale_matrix,
+            backend=backend,
+        )
 
 
-def test_convolve_blanks_around_nans() -> None:
+def test_convolve_blanks_around_nans(backend: ConvolveBackend) -> None:
     wcs = sky_wcs()
     image = point_sources(wcs, (128, 128), BeamShape(12, 8, 30))
     image[:, :20] = np.nan
     convolved = convolve_to_beam(
-        image, BeamShape(12, 8, 30), BeamShape(30, 30, 0), wcs.pixel_scale_matrix
+        image,
+        BeamShape(12, 8, 30),
+        BeamShape(30, 30, 0),
+        wcs.pixel_scale_matrix,
+        backend=backend,
     )
     assert np.all(np.isnan(convolved[:, :20]))
     assert np.all(np.isfinite(convolved[:, 40:100]))
 
 
-def test_common_beam() -> None:
+def test_common_beam(backend: ConvolveBackend) -> None:
     beams = [
         BeamShape(12, 8, 30),
         BeamShape(10, 10, 0),
@@ -110,7 +141,7 @@ def test_common_beam() -> None:
         BeamShape(0, 0, 0),
         BeamShape(90, 90, 0),
     ]
-    found = common_beam(beams, cutoff_arcsec=60)
+    found = common_beam(beams, cutoff_arcsec=60, backend=backend)
     assert found.bmaj_arcsec < 20
     for beam in beams[:3]:
         assert beam is not None
@@ -118,10 +149,10 @@ def test_common_beam() -> None:
         assert np.min(np.linalg.eigvalsh(difference)) > -1e-12
     assert np.isclose(found.bmaj_arcsec * 10, round(found.bmaj_arcsec * 10))
 
-    circular = common_beam(beams, cutoff_arcsec=60, circularise=True)
+    circular = common_beam(beams, cutoff_arcsec=60, circularise=True, backend=backend)
     assert circular.bmin_arcsec == circular.bmaj_arcsec
     with pytest.raises(ValueError, match="usable"):
-        common_beam([None, BeamShape(0, 0, 0)])
+        common_beam([None, BeamShape(0, 0, 0)], backend=backend)
 
 
 def test_common_beam_says_what_it_left_out(caplog: pytest.LogCaptureFixture) -> None:
@@ -142,35 +173,42 @@ def write_beam_image(path: Path, beam: BeamShape) -> Path:
     return path
 
 
-def test_convolve_fits(tmp_path: Path) -> None:
+def test_convolve_fits(tmp_path: Path, backend: ConvolveBackend) -> None:
     path = write_beam_image(tmp_path / "a.beam00.fits", BeamShape(12, 8, 30))
     new = BeamShape(25, 15, -50)
-    output = convolve_fits(path, new)
+    output = convolve_fits(path, new, backend=backend)
     assert output == convolved_name(path) == tmp_path / "a.beam00.conv.fits"
     header = fits.getheader(output)
     assert BeamShape.from_header(header) == pytest.approx(new)
     assert fits.getdata(output).shape == (1, 1, 128, 128)
 
     blanked = convolve_fits(
-        path, new, output_path=tmp_path / "blank.fits", cutoff_arcsec=10
+        path,
+        new,
+        output_path=tmp_path / "blank.fits",
+        cutoff_arcsec=10,
+        backend=backend,
     )
     assert BeamShape.from_header(fits.getheader(blanked)) == (0, 0, 0)
     assert np.all(np.isnan(fits.getdata(blanked)))
 
 
-def test_convolve_images_and_cli(tmp_path: Path) -> None:
+def test_convolve_images_and_cli(tmp_path: Path, backend: ConvolveBackend) -> None:
     images = [
         write_beam_image(tmp_path / "a.fits", BeamShape(12, 8, 30)),
         write_beam_image(tmp_path / "b.fits", BeamShape(10, 10, 0)),
     ]
-    beam, outputs = convolve_images(images)
+    beam, outputs = convolve_images(images, ConvolveOptions(convolve_backend=backend))
     assert all(
         BeamShape.from_header(fits.getheader(output)) == pytest.approx(beam)
         for output in outputs
     )
 
     _, targeted = convolve_images(
-        images, ConvolveOptions(target_beam=(30, 30, 0), suffix="big")
+        images,
+        ConvolveOptions(
+            target_beam=(30, 30, 0), suffix="big", convolve_backend=backend
+        ),
     )
     assert targeted[0].name == "a.big.fits"
 
@@ -178,17 +216,19 @@ def test_convolve_images_and_cli(tmp_path: Path) -> None:
     assert BeamShape.from_header(fits.getheader(outputs[0])).bpa_deg == 0  # type: ignore[union-attr]
 
 
-def test_convolution_does_not_wrap_around() -> None:
+def test_convolution_does_not_wrap_around(backend: ConvolveBackend) -> None:
     """Flux spread off one edge does not come back on the opposite edge, even for an image whose size needs no padding to transform quickly."""
     pixel_scale = np.diag([-2 / 3600, 2 / 3600])
     old, new = BeamShape(10, 10, 0), BeamShape(60, 60, 0)
     image = np.zeros((256, 256), dtype=np.float32)
     image[128, 0] = 1.0
-    convolved = convolve_to_beam(image, old, new, pixel_scale)
+    convolved = convolve_to_beam(image, old, new, pixel_scale, backend=backend)
     # The same source well inside a wider image, where nothing can wrap
     wide = np.zeros((256, 768), dtype=np.float32)
     wide[128, 256] = 1.0
-    expected = convolve_to_beam(wide, old, new, pixel_scale)[:, 256:512]
+    expected = convolve_to_beam(wide, old, new, pixel_scale, backend=backend)[
+        :, 256:512
+    ]
     assert np.allclose(convolved, expected, atol=1e-5)
     assert abs(convolved[128, -1]) < 1e-5
 
@@ -210,3 +250,74 @@ def test_convolve_refuses_to_write_over_an_input(tmp_path: Path) -> None:
     assert [path.name for path in again] == ["a.conv.fits", "a.fits"]
     with pytest.raises(FileExistsError, match="also an input"):
         convolve_images(again, overwrite=True)
+
+
+@needs_convolve_rs
+@pytest.mark.parametrize(
+    ("cdelt1_sign", "rotation_deg"), [(-1, 0.0), (1, 0.0), (-1, 25.0)]
+)
+def test_rust_matches_scipy(cdelt1_sign: int, rotation_deg: float) -> None:
+    """The two backends give the same image and NaN mask, edges included, on
+    any grid, and the same common beam to within its rounding."""
+    wcs = sky_wcs(cdelt1_sign, rotation_deg)
+    old, new = BeamShape(12, 8, 30), BeamShape(25, 15, -50)
+    image = point_sources(wcs, (200, 230), old).astype(np.float32)
+    image += np.random.default_rng(0).normal(0, 1e-3, image.shape).astype(np.float32)
+    image[40:90, 20:70] = np.nan
+    image[150, 180] = np.nan
+    scipy, rust = (
+        convolve_to_beam(image, old, new, wcs.pixel_scale_matrix, backend=b)
+        for b in BACKENDS
+    )
+    assert np.array_equal(np.isnan(scipy), np.isnan(rust))
+    finite = np.isfinite(scipy)
+    assert np.max(np.abs(scipy[finite] - rust[finite])) < 1e-5
+
+    beams: list[BeamShape | None] = [
+        BeamShape(12, 8, 30),
+        BeamShape(10, 10, 0),
+        BeamShape(15, 6, -60),
+    ]
+    scipy_beam, rust_beam = (common_beam(beams, backend=b) for b in BACKENDS)
+    assert rust_beam.bmaj_arcsec == pytest.approx(scipy_beam.bmaj_arcsec, abs=0.11)
+    assert rust_beam.bmin_arcsec == pytest.approx(scipy_beam.bmin_arcsec, abs=0.11)
+    pa_difference = (rust_beam.bpa_deg - scipy_beam.bpa_deg + 90) % 180 - 90
+    assert abs(pa_difference) < 0.5
+
+
+@needs_convolve_rs
+def test_rust_uses_the_clipped_kernel() -> None:
+    """A target a hair inside the old beam, as a rounded common beam can be,
+    is convolved with the same clipped kernel by both backends."""
+    wcs = sky_wcs()
+    old = BeamShape(12, 8, 30)
+    new = BeamShape(12, 8 - 1e-4, 30)
+    image = point_sources(wcs, (64, 64), old)
+    scipy, rust = (
+        convolve_to_beam(image, old, new, wcs.pixel_scale_matrix, backend=b)
+        for b in BACKENDS
+    )
+    assert np.allclose(scipy, rust, atol=1e-6)
+
+
+def test_beam_from_covariance_round_trips() -> None:
+    for beam in (BeamShape(12, 8, 30), BeamShape(20, 5, -75), BeamShape(9, 9, 0)):
+        again = beam_from_covariance(beam_covariance(beam))
+        assert again.bmaj_arcsec == pytest.approx(beam.bmaj_arcsec)
+        assert again.bmin_arcsec == pytest.approx(beam.bmin_arcsec)
+        if beam.bmaj_arcsec != beam.bmin_arcsec:
+            assert (again.bpa_deg - beam.bpa_deg + 90) % 180 - 90 == pytest.approx(0)
+
+
+def test_rust_backend_says_how_to_install(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setitem(sys.modules, "convolve_rs", None)
+    wcs = sky_wcs()
+    image = np.zeros((32, 32))
+    with pytest.raises(ImportError, match=r"askap-patchwork\[rust\]"):
+        convolve_to_beam(
+            image,
+            BeamShape(10, 10, 0),
+            BeamShape(20, 20, 0),
+            wcs.pixel_scale_matrix,
+            backend="rust",
+        )

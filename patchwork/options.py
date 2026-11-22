@@ -158,6 +158,8 @@ class ConvolveOptions(BaseOptions):
     """Epsilon of the common beam search"""
     suffix: str = "conv"
     """Suffix inserted before ``.fits`` in the names of convolved images"""
+    convolve_backend: Literal["scipy", "rust"] = "scipy"
+    """Convolve with scipy, or with convolve-rs, which is installed with ``pip install askap-patchwork[rust]``. Both give the same images and common beams"""
 
 
 class RotateOptions(BaseOptions):
