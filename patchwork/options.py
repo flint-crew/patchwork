@@ -128,13 +128,15 @@ class RunOptions(BaseOptions):
     channel_chunk: int = 16
     """Number of channels each task makes. More channels share more of the work (the positions and primary beams of a tile), and take more memory"""
     tasks_in_flight: int | None = None
-    """Most tiles made at once. The process writing a FITS mosaic holds each finished tile until it is written, so this bounds its memory: if None, twice the number of tasks the executor runs at once. Where the workers write the mosaic (``fits_writer`` ``workers``, or zarr) nothing is held, and None queues every tile, so an adaptive dask cluster sees all the work and grows to its maximum"""
+    """Most tiles made at once. The process writing a FITS mosaic holds each finished tile until it is written, so this bounds its memory, with ``fits_buffer_mb``: if None, twice the number of tasks the executor runs at once. Where the workers write the mosaic (``fits_writer`` ``workers``, or zarr) nothing is held, and None queues every tile, so an adaptive dask cluster sees all the work and grows to its maximum"""
     convolve: Literal["none", "natural", "total"] = "none"
     """Convolve the inputs to a common beam first: each channel to the smallest beam that encloses that channel of every input (``natural``), or every channel to one beam (``total``). For images, which have one channel, the two are the same"""
     output_format: Literal["fits", "zarr"] = "fits"
     """Write the mosaic as FITS, or as zarr stores (one (channel, y, x) array per image, as rm-lite reads them)"""
     fits_writer: Literal["driver", "workers"] = "driver"
     """Which processes write FITS outputs: the one driving the mosaic, as tiles arrive (``driver``), or the tasks themselves, each into its own strip of whole rows (``workers``). Workers need a file system that keeps one file consistent while several machines write to it, such as Lustre or GPFS, and not NFS"""
+    fits_buffer_mb: int = 4096
+    """Most memory in megabytes that the process writing a FITS mosaic (``fits_writer`` ``driver``) holds in bands of tiles, on top of the tiles in flight. Each band, a row of tiles across the frame over the channels of a task, is written once all its tiles have arrived, as one run of bytes per channel of each file, which on file systems such as Lustre is far faster than writing each row of each tile. A band takes ``tile_size x frame width x channel_chunk x 4`` bytes for each image and weight. The tiles of a band that does not fit are written a row at a time"""
     zarr_chunk: int = 256
     """Size in pixels of the square chunks of zarr output. Each is made over every channel by one task"""
     keep_convolved: bool = False
