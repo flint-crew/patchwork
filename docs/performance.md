@@ -231,11 +231,12 @@ Three things differ:
   dask cluster of N single-threaded processes.
 - On a cluster, use `patchwork-pipeline ...` with single-threaded workers, one
   for each core, and have the workers write the mosaic: `--fits-writer workers`
-  on Lustre or GPFS, or `--output-format zarr` on any file system. Otherwise the
-  process running the pipeline writes every tile, and the workers wait for it.
-  Each tile is a task, and no more than `--tasks-in-flight` tiles are made at
-  once. On a cluster that adapts its size, set that to twice the most threads it
-  can have, so it has enough work in view to grow (see [pipeline](pipeline.md)).
+  on Lustre or GPFS, or `--output-format zarr` on any file system. Otherwise
+  every tile passes through the process running the pipeline, which the workers
+  can end up waiting for. Each tile is a task, and no more than
+  `--tasks-in-flight` tiles are made at once. On a cluster that adapts its size,
+  set that to twice the most threads it can have, so it has enough work in view
+  to grow (see [pipeline](pipeline.md)).
 - On a cluster whose workers have one thread and many cores, use
   `--backend fused --tile-threads 0` (see the fused backend, above), with a
   larger `--tile-size`.
