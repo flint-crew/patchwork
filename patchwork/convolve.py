@@ -261,17 +261,23 @@ def convolve_to_beam(
         )
         padded_image = np.zeros(padded, dtype=real_dtype)
         padded_image[:ny, :nx] = image
-        padded_image[~np.isfinite(padded_image)] = np.nan
+        # convolve-rs blanks around NaNs only, so infinities are made NaN
+        infinite = np.isinf(padded_image)
+        if infinite.any():
+            padded_image[infinite] = np.nan
         cr = convolve_rs()
         convolved = cr.smooth(
             padded_image,
             cr.Beam.from_arcsec(*old_beam),
             cr.Beam.from_arcsec(*target),
             pixel_scale_matrix=np.asarray(pixel_scale_matrix).tolist(),
-            bunit="K",
+            # Jy/beam scales by the areas of the beams passed, so a clipped
+            # target is scaled here, by the area of the beam asked for
+            bunit="K" if clipped else "Jy/beam",
             nan_fraction=0.5,
         )[:ny, :nx]
-        convolved *= area_ratio
+        if clipped:
+            convolved *= area_ratio
         if not np.all(np.isfinite(image)):
             logger.info(
                 f"Blanked {np.mean(np.isnan(convolved)):.1%} of the convolved image"
