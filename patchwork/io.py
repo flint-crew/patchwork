@@ -7,7 +7,7 @@ import os
 import re
 import warnings
 from pathlib import Path
-from typing import TYPE_CHECKING, BinaryIO, NamedTuple
+from typing import TYPE_CHECKING, Any, BinaryIO, NamedTuple
 
 import astropy.units as u
 import numpy as np
@@ -414,6 +414,12 @@ def _mapped_location(path: str, modified_ns: int, size: int) -> DataLocation | N
     return location
 
 
+def readable_location(path: str | Path) -> DataLocation | None:
+    """Where the data of a FITS file lies, if it can be read straight from the file: plain float32 that is not compressed and is all there, or None."""
+    status = Path(path).stat()
+    return _mapped_location(str(path), status.st_mtime_ns, status.st_size)
+
+
 def read_window(
     path: str | Path,
     region: Slices,
@@ -437,8 +443,7 @@ def read_window(
     Returns:
         NDArray[np.floating]: ``out``, with NaN wherever there is no data
     """
-    status = Path(path).stat()
-    location = _mapped_location(str(path), status.st_mtime_ns, status.st_size)
+    location = readable_location(path)
     if location is None:
         return read_block(path, region, channels, out=out)
     data = np.memmap(
@@ -546,22 +551,58 @@ def _write_all(file: BinaryIO, data: memoryview, offset: int) -> None:
         written += count
 
 
-def read_rows(location: DataLocation, rows: slice, channel: int) -> NDArray[np.float32]:
-    """Read whole rows of one channel of a float32 FITS image, as (y, x)."""
-    n_rows = rows.stop - rows.start
-    size = 4 * n_rows * location.shape[-1]
-    offset = _rows_offset(location, channel, rows.start)
-    data = b""
-    with location.path.open("rb") as file:
-        while len(data) < size:
-            chunk = os.pread(file.fileno(), size - len(data), offset + len(data))
-            if not chunk:
-                msg = (
-                    f"{location.path} ends before row {rows.stop} of channel {channel}"
-                )
-                raise ValueError(msg)
-            data += chunk
-    return np.frombuffer(data, dtype=">f4").astype(np.float32).reshape(n_rows, -1)
+def _read_into(path: Path, offset: int, out: NDArray[Any]) -> bool:
+    """Fill an array with the bytes of a file from an offset, in as few reads as the system allows.
+
+    Returns:
+        bool: False if the file ends first
+    """
+    buffer = memoryview(out.reshape(-1).view(np.uint8))
+    with path.open("rb", buffering=0) as file:
+        file.seek(offset)
+        got = 0
+        while got < len(buffer):
+            count = file.readinto(buffer[got:])
+            if not count:
+                return False
+            got += count
+    return True
+
+
+def read_rows(
+    location: DataLocation, rows: slice, channel: int, step: int = 1
+) -> NDArray[np.float32]:
+    """Read whole rows of one channel of a float32 FITS image, as (y, x), with one read.
+
+    With ``step`` every row is still read, as one run of bytes, but only every
+    ``step``'th from the first is kept. On a file system such as Lustre a read
+    of a few MB takes little longer than one of a single row, so this is far
+    faster than reading the rows on their own.
+    """
+    data = np.empty((rows.stop - rows.start, location.shape[-1]), dtype=">f4")
+    if not _read_into(location.path, _rows_offset(location, channel, rows.start), data):
+        msg = f"{location.path} ends before row {rows.stop} of channel {channel}"
+        raise ValueError(msg)
+    return data[::step].astype(np.float32)
+
+
+def read_plane_at(
+    location: DataLocation, index: tuple[int, ...]
+) -> NDArray[np.float32]:
+    """Read one (y, x) plane of a float32 FITS image or cube, at an index of each of its other axes in numpy order, with one read.
+
+    Raises:
+        ValueError: Raised if the index is not one of the data, or the file ends before the plane does
+    """
+    if len(index) != len(location.shape) - 2:
+        msg = f"Index {index} of {location.path} does not pick a plane of data shaped {location.shape}"
+        raise ValueError(msg)
+    first = np.ravel_multi_index((*index, 0, 0), location.shape)
+    data = np.empty(location.shape[-2:], dtype=">f4")
+    if not _read_into(location.path, location.offset + 4 * int(first), data):
+        msg = f"{location.path} ends before the plane at {index}"
+        raise ValueError(msg)
+    return data.astype(np.float32)
 
 
 def suffixed_name(path: str | Path, suffix: str) -> Path:

@@ -218,6 +218,15 @@ call `patchwork.logging.setup_logging()` to print the messages, and
 `patchwork-pipeline` does the same on every dask worker, including workers that
 join later. Call it from your own scripts to print them in the same way.
 
+Each stage before the tiles logs a line as it starts: reading the headers of the
+images, reading their holography beams, convolving them, and measuring their
+noise. Once the tiles are made, the main process logs how many bands of rows it
+wrote and how long writing them took, and the mosaic logs how long each stage
+took, from reading the headers on. These lines are logged from the thread that
+called `patchwork.mosaic.mosaic`, so they reach Prefect, which records only the
+messages of its task's own thread, and not those of the threads patchwork
+starts.
+
 With `--log-level DEBUG` (`setup_logging("DEBUG")`) each tile also logs where
 its time went: how long it waited for its inputs to be read, spent adding them
 and finalising, how long its threads spent finding and reading the inputs and

@@ -168,6 +168,10 @@ def test_rows_written_in_place(tmp_path: Path, axes: str) -> None:
     assert np.array_equal(data, expected)
     assert path.read_bytes()[: location.offset] == before[: location.offset]
     assert np.array_equal(read_rows(location, slice(2, 5), channels.start), block[0])
+    assert np.array_equal(
+        read_rows(location, slice(1, 7), channels.start, step=2),
+        expected[channels.start, 1:7:2],
+    )
 
     # Blocks that do not fill the rows they are given would write over others
     for rows, channels, shape in (

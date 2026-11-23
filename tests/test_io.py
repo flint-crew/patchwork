@@ -16,6 +16,8 @@ from patchwork.io import (
     read_block,
     read_image_info,
     read_plane,
+    read_plane_at,
+    readable_location,
     write_block,
 )
 
@@ -178,3 +180,39 @@ def test_output_drops_checksums(tmp_path: Path) -> None:
     header = fits.getheader(output)
     assert "CHECKSUM" not in header
     assert "DATASUM" not in header
+
+
+def test_read_plane_at_matches_astropy(tmp_path: Path) -> None:
+    """A plane at any index of the other axes is read with one call as astropy reads it."""
+    data = np.random.default_rng(0).normal(size=(3, 4, 5, 7, 6)).astype(np.float32)
+    path = tmp_path / "cube.fits"
+    fits.writeto(path, data)
+    location = readable_location(path)
+    assert location is not None
+    for index in [(0, 0, 0), (2, 3, 4), (1, 2, 3)]:
+        assert np.array_equal(read_plane_at(location, index), data[index])
+    with pytest.raises(ValueError, match="does not pick a plane"):
+        read_plane_at(location, (0, 0))
+    with pytest.raises(ValueError, match="invalid entry"):
+        read_plane_at(location, (3, 0, 0))
+    # A file that ends early, after its layout was found
+    with path.open("r+b") as file:
+        file.truncate(location.offset + 4 * 6 * 7 * 10)
+    with pytest.raises(ValueError, match="ends before the plane"):
+        read_plane_at(location, (2, 3, 4))
+
+
+def test_readable_location_only_of_plain_float32(tmp_path: Path) -> None:
+    """Data that are not plain float32, or not all there, are left to astropy to read."""
+    data = np.ones((4, 5), dtype=np.float32)
+    plain, double, scaled = (
+        tmp_path / f"{name}.fits" for name in ("plain", "double", "scaled")
+    )
+    fits.writeto(plain, data)
+    fits.writeto(double, data.astype(np.float64))
+    hdu = fits.PrimaryHDU(data)
+    hdu.header["BSCALE"] = 2.0
+    hdu.writeto(scaled)
+    assert readable_location(plain) is not None
+    assert readable_location(double) is None
+    assert readable_location(scaled) is None
