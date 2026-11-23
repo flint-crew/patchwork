@@ -1,18 +1,26 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 import numpy as np
 import pytest
+from astropy.io import fits
 
+import patchwork.weights
+from patchwork.io import readable_location
 from patchwork.weights import (
     image_noise_weight,
     measure_image_weight,
+    measure_weights,
     weight_from_map,
     weighting,
 )
 
+from .conftest import strided_weights
+
 if TYPE_CHECKING:
+    from pathlib import Path
+
     from .conftest import ImageFactory
 
 
@@ -72,3 +80,45 @@ def test_weighting_without_a_primary_beam() -> None:
     factor, weight = weighting(None, 3.0, "primary_beam", "corrected")
     assert np.allclose(factor, 1)
     assert np.allclose(weight, 1)
+
+
+@pytest.mark.parametrize("mode", ["mad", "std"])
+@pytest.mark.parametrize("stride", [3, 8])
+# A plane in one read, a run of one stride at a time, and runs that end part way through the plane
+@pytest.mark.parametrize("read_bytes", [64 * 2**20, 4 * 200, 4 * 200 * 20])
+def test_measure_weights_as_rows_read_alone(
+    make_image: ImageFactory,
+    monkeypatch: pytest.MonkeyPatch,
+    mode: Literal["mad", "std"],
+    stride: int,
+    read_bytes: int,
+) -> None:
+    """Reading whole planes and keeping every ``stride``'th row gives the weights that reading those rows alone does."""
+    monkeypatch.setattr(patchwork.weights, "NOISE_READ_BYTES", read_bytes)
+    paths = [
+        make_image(
+            f"image{index}.fits", 150.0, -30.0, noise=0.1 * (index + 1), seed=index
+        )
+        for index in range(3)
+    ]
+    with fits.open(paths[1], mode="update") as hdul:
+        hdul[0].data[0, 0, 40:60] = np.nan
+    expected = [strided_weights(path, mode, stride) for path in paths]
+    for threads in (1, 4):
+        assert (
+            measure_weights(paths, mode=mode, stride=stride, threads=threads)
+            == expected
+        )
+    assert measure_weights(paths, mode="none") == [(1.0,)] * 3
+
+
+def test_measure_weights_of_data_astropy_reads(
+    make_image: ImageFactory, tmp_path: Path
+) -> None:
+    """Data that cannot be read straight from the file, such as float64, are measured through astropy, to the same weights."""
+    path = make_image("image.fits", 150.0, -30.0, noise=0.1)
+    with fits.open(path) as hdul:
+        double = tmp_path / "double.fits"
+        fits.writeto(double, hdul[0].data.astype(np.float64), hdul[0].header)
+    assert readable_location(double) is None
+    assert measure_weights([double]) == measure_weights([path])

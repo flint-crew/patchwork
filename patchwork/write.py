@@ -111,7 +111,11 @@ def write_tiles(
     bands: dict[tuple[int, int], _Band] = {}
     by_rows: set[tuple[int, int]] = set()
     held = 0
+    # What was written, and the seconds it took, to log once all is
+    n_tiles = n_bands = band_bytes = row_tiles = 0
+    band_seconds = row_seconds = 0.0
     for result in results:
+        n_tiles += 1
         channels = _output_channels(plan, result.channels)
         rows, columns = result.slices
         shape = (channels.stop - channels.start, rows.stop - rows.start)
@@ -138,8 +142,11 @@ def write_tiles(
                 # Every tile of it, as a band written whole would write over them
                 by_rows.add(key)
         if band is None:
+            started = time.perf_counter()
             for location, block in zip(files, blocks, strict=True):
                 write_tile_rows(location, result.slices, channels, block)
+            row_tiles += 1
+            row_seconds += time.perf_counter() - started
             logger.debug(
                 f"Wrote tile {result.slices} of channels {result.channels} a row at a time"
             )
@@ -155,10 +162,14 @@ def write_tiles(
             write_rows(location, rows, channels, data)
         del bands[key]
         held -= band.data.nbytes
+        seconds = time.perf_counter() - started
+        n_bands += 1
+        band_bytes += band.data.nbytes
+        band_seconds += seconds
         logger.debug(
             f"Wrote rows {rows.start}-{rows.stop} of channels {channels.start}-{channels.stop}, "
             f"{tiles_in_band[rows.start]} tiles ({band.data.nbytes / 2**20:.0f} MB), "
-            f"in {time.perf_counter() - started:.1f} s"
+            f"in {seconds:.1f} s"
         )
     if bands:
         missing = ", ".join(
@@ -166,6 +177,13 @@ def write_tiles(
         )
         msg = f"Not every tile of some bands of the mosaic arrived: {missing}"
         raise RuntimeError(msg)
+    message = (
+        f"Wrote {n_tiles} tiles: {n_bands} band{'' if n_bands == 1 else 's'} of rows, "
+        f"{band_bytes / 2**30:.1f} GB, in {band_seconds:.1f} s"
+    )
+    if row_tiles:
+        message += f", and {row_tiles} tiles row by row in {row_seconds:.1f} s"
+    logger.info(message)
 
 
 def write_noise(plan: MosaicPlan, strip_rows: int = 1024) -> None:

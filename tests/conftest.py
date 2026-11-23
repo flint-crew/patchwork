@@ -11,9 +11,10 @@ import pytest
 from astropy.io import fits
 from numpy.typing import NDArray
 
-from patchwork.io import celestial_wcs
+from patchwork.io import celestial_wcs, read_block, read_image_info
 from patchwork.primary_beam import direction_cosines, gaussian_beam
 from patchwork.resample import available_cpus
+from patchwork.weights import image_noise_weight
 
 # numba starts a thread for each CPU the process may run on, and the tests of
 # the fused backend make tiles with up to 3. On a smaller machine, such as a CI
@@ -107,3 +108,22 @@ def make_image(tmp_path: Path, sky_model: SkyModel) -> ImageFactory:
         return path
 
     return factory
+
+
+def strided_weights(
+    path: Path, mode: str, stride: int, channels: slice | None = None
+) -> tuple[float, ...]:
+    """The weights of the channels of an image as patchwork measured them before it read planes whole: every ``stride``'th row read through astropy."""
+    n_channels = read_image_info(path).n_channels
+    start, stop, _ = (channels or slice(None)).indices(n_channels)
+    block = read_block(
+        path,
+        region=(slice(None, None, stride), slice(None)),
+        channels=slice(start, stop),
+    )
+    weights = [0.0] * n_channels
+    weights[start:stop] = [
+        image_noise_weight(plane, mode=mode, stride=1)  # type: ignore[arg-type]
+        for plane in block
+    ]
+    return tuple(weights)

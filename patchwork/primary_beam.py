@@ -12,6 +12,7 @@ from astropy.io import fits
 from scipy.ndimage import map_coordinates
 
 from patchwork.coordinates import offsets, unit_vectors
+from patchwork.io import DataLocation, read_plane_at, readable_location
 from patchwork.logging import logger
 
 if TYPE_CHECKING:
@@ -231,8 +232,10 @@ def usable_planes(
 ) -> tuple[NDArray[np.float64], NDArray[np.int64], NDArray[np.float64]]:
     """The frequency of every plane of a beam of a holography cube, which planes respond at the beam centre, and that response.
 
-    Only the pixels around the centre of every plane are read. The result is
-    kept, as every channel of every input that uses the beam needs it.
+    Only the pixels around the centre of every plane are read, but that is a
+    read of every plane of the beam. ``nearest_planes`` and
+    ``load_holography_beam`` look only at the planes nearest the frequencies
+    they are asked for, and choose the same planes.
 
     Raises:
         ValueError: Raised if the beam centre is near the cube edge, or the beam has no usable planes
@@ -280,14 +283,163 @@ def usable_planes(
     return np.asarray(freqs_hz, dtype=np.float64), usable, centre
 
 
+class _CubeLayout(NamedTuple):
+    """What the beams of a holography cube are built from, as its header gives it"""
+
+    shape: tuple[int, ...]
+    """The shape of the data, in numpy order: (beam, stokes, freq, y, x), or (beam, freq, y, x)"""
+    location: DataLocation | None
+    """Where the data lies in the file, if a plane can be read straight from it"""
+    centre_pixel: tuple[float, float]
+    """Zero-based (x, y) pixel of the beam centre"""
+    pixel_scale_rad: tuple[float, float]
+    """Signed pixel size along x and y in radians (CDELT1, CDELT2)"""
+    frequencies_hz: NDArray[np.float64]
+    """The frequency of each plane"""
+
+
+def _stamp(holography_cube: Path) -> tuple[int, int]:
+    """When a cube was last modified, and its size, so a cube that is rewritten is read again."""
+    status = holography_cube.stat()
+    return status.st_mtime_ns, status.st_size
+
+
+@functools.lru_cache(maxsize=16)
+def _cube_layout(holography_cube: Path, stamp: tuple[int, int]) -> _CubeLayout:  # noqa: ARG001
+    """The layout of a holography cube, read from its header once.
+
+    Raises:
+        ValueError: Raised if the beam centre is near the cube edge
+    """
+    with fits.open(holography_cube) as hdul:
+        header = hdul[0].header
+    naxis = int(header["NAXIS"])
+    shape = tuple(int(header[f"NAXIS{number}"]) for number in range(naxis, 0, -1))
+    n_freq, ny, nx = shape[-3:]
+    x0, y0 = header["CRPIX1"] - 1, header["CRPIX2"] - 1
+    if min(x0, nx - 1 - x0, y0, ny - 1 - y0) < 2:
+        msg = (
+            f"The beam centre (CRPIX) of {holography_cube} is at pixel ({x0 + 1}, {y0 + 1}) "
+            f"of a {nx}x{ny} grid, too close to its edge"
+        )
+        raise ValueError(msg)
+    freqs_hz = (
+        header["CRVAL3"] + (np.arange(n_freq) + 1 - header["CRPIX3"]) * header["CDELT3"]
+    )
+    return _CubeLayout(
+        shape=shape,
+        location=readable_location(holography_cube),
+        centre_pixel=(float(x0), float(y0)),
+        pixel_scale_rad=(
+            float(np.radians(header["CDELT1"])),
+            float(np.radians(header["CDELT2"])),
+        ),
+        frequencies_hz=np.asarray(freqs_hz, dtype=np.float64),
+    )
+
+
+@functools.lru_cache(maxsize=2048)
+def _cube_plane(
+    holography_cube: Path,
+    stamp: tuple[int, int],
+    beam_number: int,
+    stokes: int,
+    plane: int,
+) -> NDArray[np.floating]:
+    """One (y, x) plane of a beam of a holography cube, as it is stored.
+
+    Each plane is read once and kept, as the inputs that share a beam, such as
+    its Stokes parameters, and the beams of one input built with different
+    rotations, all use it. A plane of plain float32 data is one run of bytes,
+    read with one call, which on a file system such as Lustre is far quicker
+    than reading it through a memory map, a page at a time.
+    """
+    layout = _cube_layout(holography_cube, stamp)
+    index = (
+        (beam_number, stokes, plane) if len(layout.shape) == 5 else (beam_number, plane)
+    )
+    if layout.location is not None:
+        data: NDArray[np.floating] = read_plane_at(layout.location, index)
+    else:
+        with fits.open(holography_cube, memmap=True) as hdul:
+            data = np.array(hdul[0].data[index], dtype=np.float64)
+    # Shared by every caller, so none may change it
+    data.flags.writeable = False
+    return data
+
+
+def _plane(
+    holography_cube: Path,
+    stamp: tuple[int, int],
+    beam_number: int,
+    stokes: int,
+    plane: int,
+) -> NDArray[np.float64]:
+    """A plane of a beam of a holography cube, with no response where it holds NaN."""
+    return np.nan_to_num(
+        np.array(
+            _cube_plane(holography_cube, stamp, beam_number, stokes, plane),
+            dtype=np.float64,
+        ),
+        copy=False,
+    )
+
+
+def _centre_response(
+    holography_cube: Path, stamp: tuple[int, int], beam_number: int, plane: int
+) -> float:
+    """The Stokes I response of a plane of a beam at the beam centre, interpolated linearly as ``usable_planes`` does."""
+    x0, y0 = _cube_layout(holography_cube, stamp).centre_pixel
+    x_low, y_low = int(np.floor(x0)), int(np.floor(y0))
+    around = np.nan_to_num(
+        np.asarray(
+            _cube_plane(holography_cube, stamp, beam_number, 0, plane)[
+                y_low : y_low + 2, x_low : x_low + 2
+            ],
+            dtype=np.float64,
+        )
+    )
+    centre = map_coordinates(around, np.array([[y0 - y_low], [x0 - x_low]]), order=1)
+    return float(centre[0])
+
+
+@functools.lru_cache(maxsize=4096)
+def _nearest_plane(
+    holography_cube: Path, stamp: tuple[int, int], beam_number: int, frequency_hz: float
+) -> int:
+    """The plane of a beam nearest a frequency that responds at the beam centre, the first of two as near.
+
+    The planes are looked at from the nearest out, so usually only the nearest
+    is read, rather than the centre of every plane.
+
+    Raises:
+        ValueError: Raised if no plane of the beam responds at its centre
+    """
+    freqs_hz = _cube_layout(holography_cube, stamp).frequencies_hz
+    # Stable, so of two planes as near the first is looked at first
+    for plane in np.argsort(np.abs(freqs_hz - frequency_hz), kind="stable"):
+        if _centre_response(holography_cube, stamp, beam_number, int(plane)) > 0:
+            return int(plane)
+    msg = f"Beam {beam_number} of {holography_cube} has no usable response"
+    raise ValueError(msg)
+
+
 def nearest_planes(
     holography_cube: Path, beam_number: int, frequencies_hz: ArrayLike
 ) -> tuple[NDArray[np.int64], NDArray[np.float64]]:
-    """The usable plane of a beam of a holography cube nearest each frequency, and the frequency of that plane."""
-    freqs_hz, usable, _ = usable_planes(Path(holography_cube), beam_number)
-    wanted = np.reshape(np.asarray(frequencies_hz, dtype=np.float64), (-1, 1))
-    nearest = usable[np.argmin(np.abs(freqs_hz[usable] - wanted), axis=1)]
-    return nearest, freqs_hz[nearest]
+    """The usable plane of a beam of a holography cube nearest each frequency, and the frequency of that plane.
+
+    A plane is usable if it responds at the beam centre, so flagged planes are
+    skipped. Of two usable planes as near a frequency, the first is taken.
+    """
+    cube = Path(holography_cube)
+    stamp = _stamp(cube)
+    wanted = np.ravel(np.asarray(frequencies_hz, dtype=np.float64))
+    nearest = np.array(
+        [_nearest_plane(cube, stamp, beam_number, float(value)) for value in wanted],
+        dtype=np.int64,
+    )
+    return nearest, _cube_layout(cube, stamp).frequencies_hz[nearest]
 
 
 def load_holography_beam(
@@ -306,7 +458,8 @@ def load_holography_beam(
     are used. NaNs count as no response, planes with no response
     at the beam centre (such as flagged channels) are skipped, and the beam is
     scaled by the ratio of the image and plane frequencies, as the beam widens
-    with wavelength.
+    with wavelength. Each plane is read once and kept, so other beams built
+    from it, such as with other rotations, read nothing.
 
     Args:
         holography_cube (Path): Cube with axes (beam, stokes, freq, dec, ra), or (beam, freq, dec, ra)
@@ -324,42 +477,40 @@ def load_holography_beam(
     Returns:
         HolographyBeam: The beam
     """
-    freqs_hz, _, centre = usable_planes(Path(holography_cube), beam_number)
-    nearest = int(nearest_planes(holography_cube, beam_number, frequency_hz)[0][0])
-    with fits.open(holography_cube, memmap=True) as hdul:
-        header = hdul[0].header
-        data = hdul[0].data
-        beam = data[beam_number] if data.ndim == 5 else data[beam_number][None]
-        if leakage and beam.shape[0] < 4:
-            msg = f"{holography_cube} has no Stokes planes to read the leakage from"
-            raise ValueError(msg)
-        x0, y0 = header["CRPIX1"] - 1, header["CRPIX2"] - 1
-        plane = np.nan_to_num(np.asarray(beam[0, nearest], dtype=np.float64))
-        leakage_planes = None
-        if leakage:
-            leakage_planes = np.nan_to_num(
-                np.asarray(beam[1:4, nearest], dtype=np.float64)
+    cube = Path(holography_cube)
+    stamp = _stamp(cube)
+    layout = _cube_layout(cube, stamp)
+    nearest = _nearest_plane(cube, stamp, beam_number, float(frequency_hz))
+    if leakage and (len(layout.shape) < 5 or layout.shape[1] < 4):
+        msg = f"{holography_cube} has no Stokes planes to read the leakage from"
+        raise ValueError(msg)
+    x0, y0 = layout.centre_pixel
+    plane = _plane(cube, stamp, beam_number, 0, nearest)
+    leakage_planes = None
+    if leakage:
+        leakage_planes = np.array(
+            [_plane(cube, stamp, beam_number, stokes, nearest) for stokes in (1, 2, 3)]
+        )
+        if normalise_leakage:
+            at_centre = map_coordinates(
+                leakage_planes,
+                np.array([np.arange(3), np.full(3, y0), np.full(3, x0)]),
+                order=1,
             )
-            if normalise_leakage:
-                at_centre = map_coordinates(
-                    leakage_planes,
-                    np.array([np.arange(3), np.full(3, y0), np.full(3, x0)]),
-                    order=1,
-                )
-                leakage_planes -= at_centre[:, None, None]
+            leakage_planes -= at_centre[:, None, None]
 
+    plane_hz = layout.frequencies_hz[nearest]
     logger.debug(
-        f"Using plane {nearest} at {freqs_hz[nearest] / 1e6:.2f} MHz of beam {beam_number}"
+        f"Using plane {nearest} at {plane_hz / 1e6:.2f} MHz of beam {beam_number}"
     )
     return HolographyBeam(
-        plane=plane / centre[nearest] if normalise else plane,
-        pixel_scale_rad=(
-            float(np.radians(header["CDELT1"])),
-            float(np.radians(header["CDELT2"])),
-        ),
-        centre_pixel=(float(x0), float(y0)),
+        plane=plane / _centre_response(cube, stamp, beam_number, nearest)
+        if normalise
+        else plane,
+        pixel_scale_rad=layout.pixel_scale_rad,
+        centre_pixel=layout.centre_pixel,
         alpha_rad=alpha_rad,
-        scale=float(frequency_hz / freqs_hz[nearest]),
+        scale=float(frequency_hz / plane_hz),
         leakage=leakage_planes,
         frame_rotation_rad=frame_rotation_rad,
         cutoff_scale=1.0 if normalise else float(np.max(plane)),

@@ -67,7 +67,7 @@ class WeightOptions(BaseOptions):
     image_weight: Literal["mad", "std", "none"] = "mad"
     """Without weight images, weight each input by its inverse variance from this noise statistic. With ``none`` every input weighs 1"""
     weight_stride: int = 8
-    """Use every n'th row when measuring the noise of an input, which reads only those rows"""
+    """Use every n'th row when measuring the noise of an input. Each plane is still read whole, which on file systems such as Lustre takes little longer than reading the rows alone"""
     weight_map_type: Literal["weight", "variance", "rms"] = "weight"
     """What the values of weight images are"""
     noise_image: bool = False
