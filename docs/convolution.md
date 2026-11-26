@@ -34,13 +34,28 @@ The new beam must enclose the old one. A new beam that is smaller than the old
 one by no more than rounding error, as a common beam can be, is accepted; a
 larger shortfall is an error.
 
-The transforms are circular, so the image is padded with zeros by five standard
-deviations of the kernel, rounded up to a size the FFT handles efficiently. Flux
-spread past one edge therefore does not wrap around onto the opposite edge.
+The sky beyond the image's edges, and under its NaN or infinite pixels, is
+missing, and both are treated the same way:
 
-NaNs are filled with zeros for the convolution. They are blanked again
-afterwards, along with every pixel where more than half of the convolved signal
-came from them.
+- The image is padded with zeros out to where the kernel holds under 1e-8 of its
+  weight (6.1 standard deviations), rounded up to a size the FFT handles
+  efficiently. So the convolution is linear: flux spread past one edge does not
+  wrap around onto the opposite edge.
+- A mask of the missing pixels, padding included, is convolved the same way,
+  giving the share of each pixel's kernel that fell on missing data. Each pixel
+  is divided by the share that fell on data, so a flat image stays flat up to
+  its edges and its NaNs.
+- A pixel with more than half of its kernel on missing data is blanked. This
+  includes the corners of every image, which have about three quarters of their
+  kernel beyond it.
+
+This is how convolve-rs 3 and racs-tools 5 convolve.
+
+With `--convolve-backend rust` (`ConvolveOptions.convolve_backend`), the
+convolution and the common beam are found with
+[convolve-rs](https://github.com/AlecThomson/convolve-rs) instead, which is
+several times faster on large images. It is installed with
+`pip install askap-patchwork[rust]`. The default is `scipy`.
 
 An image whose beam is larger than `beam_cutoff_arcsec` is blanked and given a
 zero beam, as racs-tools does.
