@@ -188,8 +188,9 @@ def convolve_to_beam(
 ) -> NDArray[np.floating]:
     """Convolve an image in Jy/beam from its restoring beam to a larger one.
 
-    NaNs are filled with zeros for the convolution and then blanked again, along
-    with every pixel where more than half of the convolved signal came from them.
+    The sky beyond the image's edges and under its NaN or infinite pixels is
+    missing. Each pixel is divided by the share of its kernel that fell on data,
+    and blanked if more than half fell on missing data.
 
     Args:
         image (NDArray[np.floating]): The (y, x) image
@@ -237,17 +238,11 @@ def convolve_to_beam(
     real_dtype: type[np.floating] = (
         np.float32 if image.dtype.itemsize <= 4 else np.float64
     )
-    ny, nx = image.shape
-    # The transforms are circular, so zeros as wide as the kernel reaches (five of
-    # its sigma) keep flux from wrapping between opposite edges
-    reach = int(np.ceil(5 * np.sqrt(np.max(eigenvalues))))
-    padded = (
-        scipy.fft.next_fast_len(ny + reach, real=True),
-        scipy.fft.next_fast_len(nx + reach, real=True),
-    )
     area_ratio = (new_beam.bmaj_arcsec * new_beam.bmin_arcsec) / (
         old_beam.bmaj_arcsec * old_beam.bmin_arcsec
     )
+    finite = np.isfinite(image)
+    has_missing = not np.all(finite)
 
     if backend == "rust":
         # The kernel clipped above is passed as the beam it gives the image
@@ -259,15 +254,13 @@ def convolve_to_beam(
             if clipped
             else new_beam
         )
-        padded_image = np.zeros(padded, dtype=real_dtype)
-        padded_image[:ny, :nx] = image
-        # convolve-rs blanks around NaNs only, so infinities are made NaN
-        infinite = np.isinf(padded_image)
-        if infinite.any():
-            padded_image[infinite] = np.nan
+        data = np.asarray(image, dtype=real_dtype)
+        if has_missing:
+            # convolve-rs takes NaNs as missing, but not infinities
+            data = np.where(finite, data, np.nan).astype(real_dtype, copy=False)
         cr = convolve_rs()
         convolved = cr.smooth(
-            padded_image,
+            data,
             cr.Beam.from_arcsec(*old_beam),
             cr.Beam.from_arcsec(*target),
             pixel_scale_matrix=np.asarray(pixel_scale_matrix).tolist(),
@@ -275,31 +268,51 @@ def convolve_to_beam(
             # target is scaled here, by the area of the beam asked for
             bunit="K" if clipped else "Jy/beam",
             nan_fraction=0.5,
-        )[:ny, :nx]
+        )
         if clipped:
             convolved *= area_ratio
-        if not np.all(np.isfinite(image)):
+        if has_missing:
             logger.info(
                 f"Blanked {np.mean(np.isnan(convolved)):.1%} of the convolved image"
             )
         return np.asarray(convolved, dtype=image.dtype)
 
-    # Images can be large, so each plane-sized array is made once and worked on in
-    # place. The taper carries the ratio of the beam areas
+    ny, nx = image.shape
+    # Zeros out to where the kernel holds under 1e-8 of its weight, 6.1 of its
+    # sigma, make the circular transforms a linear convolution
+    reach = int(np.ceil(6.1 * np.sqrt(np.max(eigenvalues)))) + 1
+    padded = (
+        scipy.fft.next_fast_len(ny + reach, real=True),
+        scipy.fft.next_fast_len(nx + reach, real=True),
+    )
+
+    # Images can be large, so each plane-sized array is made once and worked on
+    # in place. The taper has unit gain, so it also gives the share of each
+    # pixel's kernel that fell on missing data
     fy = scipy.fft.fftfreq(padded[0]).astype(real_dtype)[:, None]
     fx = scipy.fft.rfftfreq(padded[1]).astype(real_dtype)[None, :]
-    taper = (2 * float(difference[0, 1]) * fy) * fx
-    taper += float(difference[0, 0]) * fx**2
-    taper += float(difference[1, 1]) * fy**2
-    taper *= -2 * np.pi**2
-    np.exp(taper, out=taper)
-    taper *= area_ratio
+    exponent = (-4 * np.pi**2 * float(difference[0, 1]) * fy) * fx
+    # The Nyquist bin of an even axis holds +1/2 and -1/2 cycles per pixel at
+    # once, so it takes the average of the cross term at both: a cosh
+    nyquist = []
+    if padded[0] % 2 == 0:
+        nyquist.append(exponent[padded[0] // 2, :])
+    if padded[1] % 2 == 0:
+        nyquist.append(exponent[:, -1])
+    for cross in nyquist:
+        cross[...] = np.logaddexp(cross, -cross) - np.log(2)
+    exponent -= 2 * np.pi**2 * float(difference[0, 0]) * fx**2
+    exponent -= 2 * np.pi**2 * float(difference[1, 1]) * fy**2
+    taper = np.exp(exponent, out=exponent)
 
     def tapered(
-        plane: NDArray[np.generic], where: NDArray[np.bool_] | bool = True
+        plane: NDArray[np.generic],
+        fill: float = 0.0,
+        where: NDArray[np.bool_] | bool = True,
     ) -> NDArray[np.floating]:
-        """``plane``, zero where not ``where``, padded, multiplied by the taper in the Fourier domain, and cropped."""
-        padded_plane = np.zeros(padded, dtype=real_dtype)
+        """``plane`` padded with ``fill`` (and zero where not ``where``), multiplied by the taper in the Fourier domain, and cropped."""
+        padded_plane = np.full(padded, fill, dtype=real_dtype)
+        padded_plane[:ny, :nx] = 0
         np.copyto(padded_plane[:ny, :nx], plane, where=where)
         spectrum = scipy.fft.rfft2(padded_plane, overwrite_x=True)
         del padded_plane
@@ -308,17 +321,15 @@ def convolve_to_beam(
             scipy.fft.irfft2(spectrum, s=padded, overwrite_x=True)[:ny, :nx]
         )
 
-    # The NaNs are spread first, so only a mask of where they reach is held while
-    # the image is convolved
-    finite = np.isfinite(image)
-    blank = None
-    if not np.all(finite):
-        blank = ~finite
-        blank |= tapered(blank) > 0.5 * area_ratio
-
+    missing = tapered(~finite, fill=1.0)
     convolved = tapered(image, where=finite)
-    if blank is not None:
-        convolved[blank] = np.nan
+    convolved *= area_ratio
+    blank = missing > 0.5
+    # A kernel under a pixel wide rings, so the share can dip below zero
+    near = (np.abs(missing) > 1e-8) & ~blank
+    convolved[near] /= 1 - missing[near]
+    convolved[blank] = np.nan
+    if has_missing:
         logger.info(f"Blanked {np.mean(blank):.1%} of the convolved image")
 
     return np.asarray(convolved, dtype=image.dtype)

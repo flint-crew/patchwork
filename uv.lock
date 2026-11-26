@@ -102,7 +102,7 @@ test = [
 requires-dist = [
     { name = "astropy", specifier = ">=7.2.0" },
     { name = "capn-crunch", specifier = ">=1.2.0" },
-    { name = "convolve-rs", marker = "extra == 'rust'", specifier = ">=2.4.0" },
+    { name = "convolve-rs", marker = "extra == 'rust'", specifier = ">=3.0.0" },
     { name = "dask", extras = ["distributed"], specifier = ">=2025.1.0" },
     { name = "numba", marker = "extra == 'numba'", specifier = ">=0.61" },
     { name = "numpy", specifier = ">=2.0.0" },
@@ -115,7 +115,7 @@ provides-extras = ["numba", "rust", "zarr"]
 
 [package.metadata.requires-dev]
 dev = [
-    { name = "convolve-rs", specifier = ">=2.4.0" },
+    { name = "convolve-rs", specifier = ">=3.0.0" },
     { name = "mypy", specifier = ">=1.19.1" },
     { name = "numba", specifier = ">=0.61" },
     { name = "pre-commit", specifier = ">=4.5.1" },
@@ -136,7 +136,7 @@ docs = [
     { name = "sphinx-copybutton" },
 ]
 test = [
-    { name = "convolve-rs", specifier = ">=2.4.0" },
+    { name = "convolve-rs", specifier = ">=3.0.0" },
     { name = "numba", specifier = ">=0.61" },
     { name = "pytest", specifier = ">=9" },
     { name = "pytest-cov", specifier = ">=7" },
@@ -648,17 +648,17 @@ wheels = [
 
 [[package]]
 name = "convolve-rs"
-version = "2.4.0"
+version = "3.0.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
     { name = "numpy", version = "2.5.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/10/04/b115be5917662752dc3fa0ac614a0bc042563f46e05f2e9ea35b477a5740/convolve_rs-2.4.0.tar.gz", hash = "sha256:fc7ab56e22ed0e82bcbad41011e34e1daf40611f10009bf42ffb0c441eea9987", size = 587310, upload-time = "2026-11-22T03:00:15.223Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/1d/d1/ec2f41961995f65e6b3e9bb6fd88c8841e44377ec4075d96ee7d9821dbcf/convolve_rs-3.0.0.tar.gz", hash = "sha256:d6f56d2253d15c669723ca81ae6be6248cbb413186cb9ecd5ade967d01bdcc74", size = 593305, upload-time = "2026-11-22T09:56:08.939Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/64/01/ac9ecdfc45f17067054974e0d0cb9dc08f0fba40bcce3384af59a306816f/convolve_rs-2.4.0-cp310-abi3-macosx_11_0_arm64.whl", hash = "sha256:78b9fa113657449794fb03d83cf0355c55992ab82938d76b54a3a2a3dd6bfa2a", size = 1557740, upload-time = "2026-11-22T03:00:10.008Z" },
-    { url = "https://files.pythonhosted.org/packages/b5/71/4067ef891eecd076c8ee07d1f25d6d24e383c0cc60c414e9519f9a10b27d/convolve_rs-2.4.0-cp310-abi3-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:f9d07d121b1fed1acd1ff4b646bb03c8fa947cb7a39e550577c73934767fdf4e", size = 1716955, upload-time = "2026-11-22T03:00:12.051Z" },
-    { url = "https://files.pythonhosted.org/packages/14/04/0dec290ac6e57aecd547f6ed161178f196b659e830f412ca6b90c4f07a6b/convolve_rs-2.4.0-cp310-abi3-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:32cb4671c18e46dc5d0a23f971dddd8fc1844e1522b75799bc7fe24035538413", size = 2001514, upload-time = "2026-11-22T03:00:13.802Z" },
+    { url = "https://files.pythonhosted.org/packages/4b/f0/9d5be0e9a91c44990839f1ec109f2cb73f2cce881b5338d8c37404ecd4f9/convolve_rs-3.0.0-cp310-abi3-macosx_11_0_arm64.whl", hash = "sha256:5573372860104f065bfc25639ac5ff752c3225685c6781c88b785273c9ecd0a8", size = 1572792, upload-time = "2026-11-22T09:56:04.071Z" },
+    { url = "https://files.pythonhosted.org/packages/51/0e/ad2f787f396613531383dfb7293458db9adcc82d4b5f7e5904ca9b959372/convolve_rs-3.0.0-cp310-abi3-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:ecffa67f55243513687c67d17fccaa0bc6bab63239b9192ff5af11da31a24bb2", size = 1735922, upload-time = "2026-11-22T09:56:05.709Z" },
+    { url = "https://files.pythonhosted.org/packages/4b/3c/7b7f014602f30b442e3d53d41c52461af0aa535f593817dd791d37dd96e5/convolve_rs-3.0.0-cp310-abi3-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:a255aafe912473182a97cc7472cf0f9bf2f7cd8075770a4516e39345b3111ad0", size = 2016574, upload-time = "2026-11-22T09:56:07.384Z" },
 ]
 
 [[package]]

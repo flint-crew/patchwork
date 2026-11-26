@@ -84,7 +84,12 @@ def test_convolve_matches_drawn_beam(
         image, old, new, wcs.pixel_scale_matrix, backend=backend
     )
     assert convolved.dtype == np.float32
-    assert np.max(np.abs(convolved - point_sources(wcs, (256, 256), new))) < 1e-4
+    # Corners, with most of their kernel beyond the image, are blanked
+    finite = np.isfinite(convolved)
+    assert np.isnan(convolved[0, 0])
+    assert np.all(finite[64:192, 64:192])
+    expected = point_sources(wcs, (256, 256), new)
+    assert np.max(np.abs(convolved[finite] - expected[finite])) < 1e-4
 
 
 def test_convolve_identity_and_cutoff(backend: ConvolveBackend) -> None:
@@ -229,8 +234,27 @@ def test_convolution_does_not_wrap_around(backend: ConvolveBackend) -> None:
     expected = convolve_to_beam(wide, old, new, pixel_scale, backend=backend)[
         :, 256:512
     ]
-    assert np.allclose(convolved, expected, atol=1e-5)
+    # Away from the edges, where the kernel lies wholly on the image
+    assert np.allclose(convolved[80:176, 80:176], expected[80:176, 80:176], atol=1e-5)
     assert abs(convolved[128, -1]) < 1e-5
+
+
+@pytest.mark.parametrize("new", [BeamShape(40, 30, 20), BeamShape(10.5, 10.3, 0)])
+def test_flat_image_stays_flat(new: BeamShape, backend: ConvolveBackend) -> None:
+    """Pixels near the edges and NaNs are divided by the share of their kernel on
+    data, so a flat image stays flat, even for a kernel under a pixel wide."""
+    pixel_scale = np.diag([-2 / 3600, 2 / 3600])
+    old = BeamShape(10, 10, 0)
+    image = np.ones((100, 120), dtype=np.float32)
+    image[30:50, 40:70] = np.nan
+    convolved = convolve_to_beam(image, old, new, pixel_scale, backend=backend)
+    area_ratio = (new.bmaj_arcsec * new.bmin_arcsec) / (
+        old.bmaj_arcsec * old.bmin_arcsec
+    )
+    finite = np.isfinite(convolved)
+    assert np.all(np.isnan(convolved[35:45, 50:60]))
+    assert np.mean(finite) > 0.7
+    assert np.allclose(convolved[finite], area_ratio, rtol=1e-5)
 
 
 def test_convolved_name_never_names_the_image() -> None:
