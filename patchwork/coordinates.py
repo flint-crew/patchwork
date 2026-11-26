@@ -65,22 +65,84 @@ def offset_vectors(
     )
 
 
+_BLOCK = 1024
+"""Positions given one matrix of weights, so a tile of the default size has one"""
+
+
+class LinearWeights(NamedTuple):
+    """Linear interpolation from nodes onto positions along one axis, as a matrix of weights for each block of positions.
+
+    One matrix for every position would cost time and memory in the product of
+    the numbers of positions and of nodes, hundreds of megabytes for a strip
+    across a whole frame. Each block of positions lies between only a few nodes,
+    so its matrix holds only those.
+    """
+
+    starts: tuple[int, ...]
+    """The first position of each block"""
+    first_nodes: tuple[int, ...]
+    """The first node of each block's matrix"""
+    matrices: tuple[NDArray[np.float64], ...]
+    """The weights of each block, shaped (positions, nodes)"""
+
+    def __len__(self) -> int:
+        """The number of positions."""
+        return sum(len(matrix) for matrix in self.matrices)
+
+    def select(self, part: slice) -> LinearWeights:
+        """The weights of some of the positions, counted from the first of them."""
+        start, stop, _ = part.indices(len(self))
+        starts, first_nodes, matrices = [], [], []
+        for block_start, node, matrix in zip(
+            self.starts, self.first_nodes, self.matrices, strict=True
+        ):
+            low, high = max(start, block_start), min(stop, block_start + len(matrix))
+            if low < high:
+                starts.append(low - start)
+                first_nodes.append(node)
+                matrices.append(matrix[low - block_start : high - block_start])
+        return LinearWeights(tuple(starts), tuple(first_nodes), tuple(matrices))
+
+
 def _linear_weights(
     positions: NDArray[np.float64], nodes: NDArray[np.float64]
-) -> NDArray[np.float64]:
-    """The matrix that linearly interpolates values on nodes onto positions."""
-    return np.stack(
-        [np.interp(positions, nodes, column) for column in np.eye(len(nodes))], axis=1
-    )
+) -> LinearWeights:
+    """The weights that linearly interpolate values on increasing nodes onto positions, a block of positions at a time."""
+    starts, first_nodes, matrices = [], [], []
+    for start in range(0, len(positions), _BLOCK):
+        block = positions[start : start + _BLOCK]
+        low = max(int(np.searchsorted(nodes, block[0], side="right")) - 1, 0)
+        high = min(int(np.searchsorted(nodes, block[-1], side="left")) + 1, len(nodes))
+        # np.interp weighs only the two nodes around each position, so these are
+        # the weights of a matrix over all the nodes, without its zeros
+        local = nodes[low:high]
+        starts.append(start)
+        first_nodes.append(low)
+        matrices.append(
+            np.stack(
+                [np.interp(block, local, column) for column in np.eye(len(local))],
+                axis=1,
+            )
+        )
+    return LinearWeights(tuple(starts), tuple(first_nodes), tuple(matrices))
 
 
 def _between_nodes(
-    y_weights: NDArray[np.float64],
+    y_weights: LinearWeights,
     values: NDArray[np.float64],
-    x_weights: NDArray[np.float64],
+    x_weights: LinearWeights,
 ) -> NDArray[np.float64]:
     """Interpolate values on a grid of nodes, shaped (..., ny_nodes, nx_nodes), with weight matrices."""
-    return np.asarray(y_weights @ values @ x_weights.T)
+    # Each product is made in place, as copying a whole tile would take as long
+    rows = np.empty((*values.shape[:-2], len(y_weights), values.shape[-1]))
+    for start, node, matrix in zip(*y_weights, strict=True):
+        part = values[..., node : node + matrix.shape[1], :]
+        np.matmul(matrix, part, out=rows[..., start : start + len(matrix), :])
+    result = np.empty((*values.shape[:-2], len(y_weights), len(x_weights)))
+    for start, node, matrix in zip(*x_weights, strict=True):
+        part = rows[..., node : node + matrix.shape[1]]
+        np.matmul(part, matrix.T, out=result[..., start : start + len(matrix)])
+    return result
 
 
 def _nodes(start: int, stop: int, step: int) -> NDArray[np.float64]:
@@ -115,13 +177,13 @@ class TileCoordinates(NamedTuple):
     """The (RA, Dec) of the nodes, shaped (2, ny_nodes, nx_nodes)"""
     check_world: NDArray[np.float64]
     """The (RA, Dec) between the nodes, where the interpolation is checked"""
-    y_weights: NDArray[np.float64]
+    y_weights: LinearWeights
     """Interpolates node rows onto the rows of the tile"""
-    x_weights: NDArray[np.float64]
+    x_weights: LinearWeights
     """Interpolates node columns onto the columns of the tile"""
-    y_check_weights: NDArray[np.float64]
+    y_check_weights: LinearWeights
     """Interpolates node rows onto the rows between them"""
-    x_check_weights: NDArray[np.float64]
+    x_check_weights: LinearWeights
     """Interpolates node columns onto the columns between them"""
 
 
@@ -214,7 +276,9 @@ def map_to_input(
         )
         if np.max(np.abs(predicted - exact)) <= tolerance:
             x, y = _between_nodes(
-                coordinates.y_weights[rows], nodes, coordinates.x_weights[columns]
+                coordinates.y_weights.select(rows),
+                nodes,
+                coordinates.x_weights.select(columns),
             )
             return x, y
 

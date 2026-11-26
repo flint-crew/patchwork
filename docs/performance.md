@@ -27,10 +27,15 @@ For each input that covers a tile, patchwork:
 - Convolution pads each image to a size the FFT handles efficiently. flint's
   default images are 10128 pixels across, and 10128 has a prime factor of 211;
   padding makes their convolution 1.6 times faster.
-- Noise is measured from every `weight_stride`th row, and only those rows are
-  read.
-- Only the holography planes that are used are read. For 36 images, the beams
-  load in under a second.
+- Noise is measured from every `weight_stride`th row. Each plane of a plain
+  float32 image is still read whole, in reads of up to 64 MB of rows, and the
+  rows taken from it: on Lustre a read of a few MB takes little longer than a
+  read of one row, so reading the rows alone, through a memory map, is slower.
+- Only the holography planes that are used are read, each with one read, and
+  each is kept: the Stokes parameters of a beam, and its beams built with other
+  rotations as the mosaic is planned, read it once. The planes nearest each
+  frequency are looked at first, so the centre of every plane is not read. The
+  beams of different images are read in `tile_threads` threads.
 
 ## Timings
 
@@ -140,12 +145,16 @@ job's allocation. numba starts no more threads than that, or than
 `NUMBA_NUM_THREADS`. Each process logs once how many threads it makes tiles
 with, and which of numba's threading layers runs them.
 
-Every backend measures the noise of an image's channels with `tile_threads`
-threads too, each reading and measuring a run of channels, and convolves a
-cube's channels in that many threads (each channel's FFTs and copies release the
-GIL). Both stages are one task for each image, so on a single worker they
-otherwise take as long as all the images done one after another: measuring 36
-cubes of 32 channels took 12 minutes on one core of a Lustre-backed node, and a
+Every backend measures the noise with `tile_threads` threads too, each reading
+and measuring one channel of one image at a time, and holding up to 64 MB of its
+rows. patchwork's own pool shares the images between its `max_workers` tasks, so
+the many single-channel images of flint's polarisation flow are measured
+`tile_threads` at once. A dask cluster, whose threads are counted as it scales,
+is given a task for each image, so it sees them all waiting. Each cube is
+convolved in one task, its channels in `tile_threads` threads (each channel's
+FFTs and copies release the GIL). Without these threads, both stages on a single
+worker take as long as every channel done one after another: measuring 36 cubes
+of 32 channels took 12 minutes on one core of a Lustre-backed node, and a
 convolution is two padded FFTs for each channel, four where it has NaNs. A
 convolving thread holds about three padded planes, some 1.2 GB for 10000²
 planes, so give the worker memory for `tile_threads` of them.
@@ -231,11 +240,12 @@ Three things differ:
   dask cluster of N single-threaded processes.
 - On a cluster, use `patchwork-pipeline ...` with single-threaded workers, one
   for each core, and have the workers write the mosaic: `--fits-writer workers`
-  on Lustre or GPFS, or `--output-format zarr` on any file system. Otherwise the
-  process running the pipeline writes every tile, and the workers wait for it.
-  Each tile is a task, and no more than `--tasks-in-flight` tiles are made at
-  once. On a cluster that adapts its size, set that to twice the most threads it
-  can have, so it has enough work in view to grow (see [pipeline](pipeline.md)).
+  on Lustre or GPFS, or `--output-format zarr` on any file system. Otherwise
+  every tile passes through the process running the pipeline, which the workers
+  can end up waiting for. Each tile is a task, and no more than
+  `--tasks-in-flight` tiles are made at once. On a cluster that adapts its size,
+  set that to twice the most threads it can have, so it has enough work in view
+  to grow (see [pipeline](pipeline.md)).
 - On a cluster whose workers have one thread and many cores, use
   `--backend fused --tile-threads 0` (see the fused backend, above), with a
   larger `--tile-size`.

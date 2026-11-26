@@ -408,6 +408,29 @@ def test_processes_match_serial(
         )
 
 
+def test_bands_and_rows_make_the_same_files(
+    make_image: ImageFactory, tmp_path: Path
+) -> None:
+    """The main process makes the same images, weights and noise whether it gathers tiles into bands or writes each a row at a time."""
+    images = [
+        make_image("a.fits", 150.0, -30.0, noise=1e-3),
+        make_image("b.fits", 150.5, -29.9, noise=1e-3, seed=4),
+    ]
+    options = MosaicOptions(
+        resample=ResampleOptions(tile_size=64),
+        weight=WeightOptions(noise_image=True),
+    )
+    bands = mosaic(images, tmp_path / "bands", options, max_workers=2)
+    rows = mosaic(
+        images, tmp_path / "rows", options, RunOptions(fits_buffer_mb=0), max_workers=2
+    )
+    for band_paths, row_paths in zip(bands, rows, strict=True):
+        for band_path, row_path in zip(band_paths, row_paths, strict=True):
+            assert np.array_equal(
+                fits.getdata(band_path), fits.getdata(row_path), equal_nan=True
+            )
+
+
 def test_processes_are_sent_the_plan_once(tmp_path: Path) -> None:
     """What a task is sent is a short reference to the plan, which each process reads once."""
     plan = {"tiles": list(range(10000))}

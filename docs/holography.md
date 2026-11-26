@@ -49,7 +49,7 @@ names its images. Otherwise it is given as the `beam_numbers` of
 `patchwork.mosaic.mosaic`.
 
 Each channel of each input uses the plane nearest its frequency, and its leakage
-comes from the same plane.
+comes from the same plane. Of two planes as near, the first is used.
 
 - Planes with no response at the beam centre are flagged channels, which are NaN
   in the cubes, and are skipped. In the 1295 MHz cube, for example, every beam
@@ -61,6 +61,9 @@ comes from the same plane.
   than 2 MHz from it. This happens among flagged planes, and beyond either end
   of the cube.
 - A beam with no usable plane is an error, as for beam 12 of the 1655 MHz cube.
+- The planes are looked at from the nearest out, so only those nearer than the
+  usable plane are read. `patchwork.primary_beam.usable_planes` reads the centre
+  of every plane, to list the usable ones.
 
 The beam widens with wavelength, so a channel at frequency `f` reads the plane
 at offset `s r`, with `s = f / f_plane`. On a plane, `s` is 1.

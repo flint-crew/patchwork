@@ -9,6 +9,7 @@ from __future__ import annotations
 import logging
 import sys
 import time
+from collections import Counter
 from concurrent.futures import (
     FIRST_COMPLETED,
     Executor,
@@ -16,7 +17,8 @@ from concurrent.futures import (
     ThreadPoolExecutor,
     wait,
 )
-from contextlib import ExitStack, closing
+from contextlib import closing
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar
 
 import numpy as np
@@ -25,14 +27,13 @@ from astropy.io import fits
 from patchwork.io import (
     beams_header,
     create_output_fits,
-    data_index,
     data_location,
     read_rows,
-    spectral_axis,
-    write_block,
     write_rows,
+    write_tile_rows,
 )
 from patchwork.logging import logger
+from patchwork.options import RunOptions
 from patchwork.resample import resolve_backend, tile_threads
 from patchwork.tile import mosaic_tile
 
@@ -42,7 +43,7 @@ if TYPE_CHECKING:
     from numpy.typing import NDArray
 
     from patchwork.io import DataLocation, Slices
-    from patchwork.options import MosaicOptions, RunOptions
+    from patchwork.options import MosaicOptions
     from patchwork.plan import MosaicNames, MosaicPlan
     from patchwork.tile import TileResult
 
@@ -66,26 +67,123 @@ def _output_channels(plan: MosaicPlan, channels: slice) -> slice:
     return slice(start, start + channels.stop - channels.start)
 
 
-def write_tiles(plan: MosaicPlan, results: Iterable[TileResult]) -> None:
-    """Write finished tiles into the output FITS files of a mosaic."""
-    with ExitStack() as stack:
-        image_hdus = [
-            stack.enter_context(fits.open(path, mode="update", memmap=True))[0]
-            for path in plan.names.images
+DEFAULT_BUFFER_BYTES = RunOptions().fits_buffer_mb * 2**20
+"""The most bytes held in bands of tiles waiting to be written, unless told otherwise"""
+
+
+@dataclass
+class _Band:
+    """The tiles of a band of rows of a mosaic, a row of tiles across the frame over some channels, gathered until all have arrived"""
+
+    data: NDArray[np.float32]
+    """The (file, channel, y, x) band of each output, as FITS holds it"""
+    waiting: int
+    """The tiles still to arrive"""
+
+
+def write_tiles(
+    plan: MosaicPlan,
+    results: Iterable[TileResult],
+    buffer_bytes: int = DEFAULT_BUFFER_BYTES,
+) -> None:
+    """Write finished tiles into the output FITS files of a mosaic, a band of rows at a time.
+
+    Each row of a tile is a short run of bytes in a file, and file systems such
+    as Lustre take as long to write a short run as a long one. So the tiles of
+    each band, a row of tiles across the frame, are gathered until all have
+    arrived, and the band is then written as one run of bytes for each channel
+    of each file. No more than ``buffer_bytes`` are held in bands: the tiles of a
+    band that would need more are written as they arrive, a row at a time.
+
+    Args:
+        plan (MosaicPlan): The plan of the mosaic, whose outputs are created
+        results (Iterable[TileResult]): The finished tiles, in any order
+        buffer_bytes (int, optional): The most bytes held in bands. Defaults to DEFAULT_BUFFER_BYTES, the default ``fits_buffer_mb``.
+
+    Raises:
+        RuntimeError: Raised if the results end before every tile of a band has arrived
+    """
+    # The noise is written from the weights once they are, so is not created yet
+    files = tuple(map(data_location, (*plan.names.images, *plan.names.weights)))
+    width = plan.frame.shape[1]
+    tiles_in_band = Counter(tile[0].start for tile in plan.tiles)
+    # By their first row and first channel
+    bands: dict[tuple[int, int], _Band] = {}
+    by_rows: set[tuple[int, int]] = set()
+    held = 0
+    # What was written, and the seconds it took, to log once all is
+    n_tiles = n_bands = band_bytes = row_tiles = 0
+    band_seconds = row_seconds = 0.0
+    for result in results:
+        n_tiles += 1
+        channels = _output_channels(plan, result.channels)
+        rows, columns = result.slices
+        shape = (channels.stop - channels.start, rows.stop - rows.start)
+        blocks = [
+            np.reshape(block, (*shape, columns.stop - columns.start))
+            for block in (*result.images, *result.weights)
         ]
-        weight_hdus = [
-            stack.enter_context(fits.open(path, mode="update", memmap=True))[0]
-            for path in plan.names.weights
-        ]
-        for result in results:
-            channels = _output_channels(plan, result.channels)
-            for hdu, block in zip(
-                (*image_hdus, *weight_hdus),
-                (*result.images, *result.weights),
-                strict=True,
-            ):
-                write_block(hdu, result.slices, block, channels)
-            logger.debug(f"Wrote tile {result.slices} of channels {result.channels}")
+        key = (rows.start, channels.start)
+        band = bands.get(key)
+        if band is None and key not in by_rows:
+            size = 4 * len(files) * shape[0] * shape[1] * width
+            if held + size <= buffer_bytes:
+                data = np.empty((len(files), *shape, width), dtype=">f4")
+                band = bands[key] = _Band(data, tiles_in_band[rows.start])
+                held += size
+            else:
+                if not by_rows:
+                    logger.info(
+                        f"A band of tiles takes {size / 2**20:.0f} MB, more than the "
+                        f"{(buffer_bytes - held) / 2**20:.0f} MB of fits_buffer_mb left, so its "
+                        "tiles are written a row at a time, which is far slower on file systems "
+                        "such as Lustre"
+                    )
+                # Every tile of it, as a band written whole would write over them
+                by_rows.add(key)
+        if band is None:
+            started = time.perf_counter()
+            for location, block in zip(files, blocks, strict=True):
+                write_tile_rows(location, result.slices, channels, block)
+            row_tiles += 1
+            row_seconds += time.perf_counter() - started
+            logger.debug(
+                f"Wrote tile {result.slices} of channels {result.channels} a row at a time"
+            )
+            continue
+
+        for index, block in enumerate(blocks):
+            band.data[index, :, :, columns] = block
+        band.waiting -= 1
+        if band.waiting:
+            continue
+        started = time.perf_counter()
+        for location, data in zip(files, band.data, strict=True):
+            write_rows(location, rows, channels, data)
+        del bands[key]
+        held -= band.data.nbytes
+        seconds = time.perf_counter() - started
+        n_bands += 1
+        band_bytes += band.data.nbytes
+        band_seconds += seconds
+        logger.debug(
+            f"Wrote rows {rows.start}-{rows.stop} of channels {channels.start}-{channels.stop}, "
+            f"{tiles_in_band[rows.start]} tiles ({band.data.nbytes / 2**20:.0f} MB), "
+            f"in {seconds:.1f} s"
+        )
+    if bands:
+        missing = ", ".join(
+            f"rows from {row}, channels from {channel}" for row, channel in bands
+        )
+        msg = f"Not every tile of some bands of the mosaic arrived: {missing}"
+        raise RuntimeError(msg)
+    message = (
+        f"Wrote {n_tiles} tiles: {n_bands} band{'' if n_bands == 1 else 's'} of rows, "
+        f"{band_bytes / 2**30:.1f} GB, in {band_seconds:.1f} s"
+    )
+    if row_tiles:
+        message += f", and {row_tiles} tiles row by row in {row_seconds:.1f} s"
+    logger.info(message)
 
 
 def write_noise(plan: MosaicPlan, strip_rows: int = 1024) -> None:
@@ -112,19 +210,19 @@ def write_noise(plan: MosaicPlan, strip_rows: int = 1024) -> None:
                 fits.append(
                     noise_path, weight_hdul["BEAMS"].data, weight_hdul["BEAMS"].header
                 )
-            weight = weight_hdul[0].data
-            with fits.open(noise_path, mode="update", memmap=True) as noise_hdul:
-                noise = noise_hdul[0].data
-                axis = spectral_axis(header)
-                n_channels = 1 if axis is None else int(header[f"NAXIS{axis}"])
-                for channel in range(n_channels):
-                    for row in range(0, int(header["NAXIS2"]), strip_rows):
-                        index = data_index(
-                            header,
-                            (slice(row, row + strip_rows), slice(None)),
-                            slice(channel, channel + 1),
-                        )
-                        noise[index] = noise_of(np.asarray(weight[index]))
+        # Whole rows at a time, each one run of bytes, as the tiles are written
+        weight_location, noise_location = (
+            data_location(weight_path),
+            data_location(noise_path),
+        )
+        n_rows = noise_location.shape[-2]
+        for channel in range(noise_location.n_channels):
+            for row in range(0, n_rows, strip_rows):
+                rows = slice(row, min(row + strip_rows, n_rows))
+                noise = noise_of(read_rows(weight_location, rows, channel))
+                write_rows(
+                    noise_location, rows, slice(channel, channel + 1), noise[None]
+                )
         logger.info(f"Written {noise_path}")
 
 
@@ -446,6 +544,7 @@ def run_tiles(
             write_tiles(
                 plan,
                 logged_progress(tiles_made, len(plan.tiles) * len(chunks), "tiles"),
+                buffer_bytes=run_options.fits_buffer_mb * 2**20,
             )
         write_noise(plan)
         return plan.names

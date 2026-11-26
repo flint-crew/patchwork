@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import logging
+import os
 import shutil
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 import numpy as np
 import pytest
@@ -10,7 +12,9 @@ from astropy.coordinates import SkyCoord
 from astropy.io import fits
 from scipy.ndimage import map_coordinates
 
-from patchwork.io import read_image_info
+import patchwork.primary_beam
+from patchwork.io import read_image_info, read_plane_at
+from patchwork.logging import logger
 from patchwork.mosaic import mosaic
 from patchwork.options import MosaicOptions, PrimaryBeamOptions, WeightOptions
 from patchwork.primary_beam import (
@@ -23,6 +27,7 @@ from patchwork.primary_beam import (
     make_primary_beam,
     nearest_planes,
     pb_rotation_from_pol_axis,
+    usable_planes,
 )
 
 from .conftest import FREQUENCY_HZ, ImageFactory
@@ -165,6 +170,145 @@ def test_nearest_planes_skip_flagged(tmp_path: Path) -> None:
     assert planes.tolist() == [0, 2]
     assert np.allclose(freqs, [9.0e8, 9.8e8])
     assert nearest_planes(cube, 0, [9.3e8, 9.79e8])[0].tolist() == [1, 2]
+
+
+def scanned_nearest_planes(
+    cube: Path, beam_number: int, frequencies_hz: np.ndarray
+) -> list[int]:
+    """The usable planes nearest some frequencies as found by reading the centre of every plane, as patchwork found them before."""
+    freqs_hz, usable, _ = usable_planes(cube, beam_number)
+    wanted = np.reshape(frequencies_hz, (-1, 1))
+    return [
+        int(plane)
+        for plane in usable[np.argmin(np.abs(freqs_hz[usable] - wanted), axis=1)]
+    ]
+
+
+def flagged_cube(path: Path, n_planes: int = 40, n_beams: int = 3) -> Path:
+    """A cube of beams with many planes flagged in different ways, and a centre between pixels."""
+    rng = np.random.default_rng(3)
+    cube = write_holography_cube(
+        path, 8e8 + 1e6 * np.arange(n_planes), size=21, n_beams=n_beams
+    )
+    with fits.open(cube, mode="update") as hdul:
+        hdul[0].header["CRPIX1"] += 0.3
+        hdul[0].header["CRPIX2"] -= 0.4
+        data = hdul[0].data
+        # Leakage that differs between the Stokes planes
+        data[:, 1:] = rng.normal(0, 0.01, data[:, 1:].shape)
+        for beam in range(n_beams):
+            for plane in rng.choice(n_planes, size=n_planes // 3, replace=False):
+                how = rng.integers(3)
+                if how == 0:
+                    data[beam, 0, plane] = np.nan
+                elif how == 1:
+                    data[beam, 0, plane] = 0.0
+                else:
+                    # Only the pixels around the centre
+                    data[beam, 0, plane, 9:12, 9:12] = -1.0
+    return cube
+
+
+def test_nearest_planes_match_a_scan_of_every_plane(tmp_path: Path) -> None:
+    """Looking out from the nearest plane picks the planes that reading the centre of every plane does, ties included."""
+    cube = flagged_cube(tmp_path / "cube.fits")
+    freqs = 8e8 + 1e6 * np.arange(40)
+    # On planes, between them, exactly halfway between them, and beyond the ends
+    wanted = np.concatenate([freqs, freqs[:-1] + 3e5, freqs[:-1] + 5e5, [7e8, 9e8]])
+    for beam in range(3):
+        planes, plane_freqs = nearest_planes(cube, beam, wanted)
+        assert planes.tolist() == scanned_nearest_planes(cube, beam, wanted)
+        assert np.array_equal(plane_freqs, freqs[planes])
+
+
+@pytest.mark.parametrize("normalise", [True, False])
+def test_holography_beam_as_read_through_astropy(
+    tmp_path: Path, normalise: bool
+) -> None:
+    """A beam read a plane at a time holds what astropy reads of the cube, normalised by the response at the centre as before."""
+    cube = flagged_cube(tmp_path / "cube.fits")
+    with fits.open(cube) as hdul:
+        data = np.nan_to_num(np.asarray(hdul[0].data, dtype=np.float64))
+        x0, y0 = hdul[0].header["CRPIX1"] - 1, hdul[0].header["CRPIX2"] - 1
+    for beam_number in range(3):
+        for frequency in (8.0e8, 8.123e8, 8.3e8):
+            plane = scanned_nearest_planes(cube, beam_number, np.array([frequency]))[0]
+            beam = load_holography_beam(
+                cube,
+                beam_number,
+                frequency,
+                leakage=True,
+                normalise=normalise,
+            )
+            stokes = data[beam_number, :, plane]
+            centre = usable_planes(cube, beam_number)[2][plane]
+            assert np.array_equal(
+                beam.plane, stokes[0] / centre if normalise else stokes[0]
+            )
+            at_centre = map_coordinates(
+                stokes[1:],
+                np.array([np.arange(3), np.full(3, y0), np.full(3, x0)]),
+                order=1,
+            )
+            assert beam.leakage is not None
+            assert np.array_equal(beam.leakage, stokes[1:] - at_centre[:, None, None])
+            assert beam.centre_pixel == (x0, y0)
+
+
+def test_holography_planes_read_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Each plane is read once, however many beams with other rotations are built from it."""
+    cube = write_holography_cube(
+        tmp_path / "cube.fits", np.array([9.0e8, 9.4e8, 9.8e8])
+    )
+    reads: list[tuple[int, ...]] = []
+    read = read_plane_at
+
+    def counted(location: Any, index: tuple[int, ...]) -> np.ndarray:
+        reads.append(index)
+        return read(location, index)
+
+    monkeypatch.setattr(patchwork.primary_beam, "read_plane_at", counted)
+    beams = [
+        load_holography_beam(cube, 0, 9.4e8, leakage=True, frame_rotation_rad=rotation)
+        for rotation in (0.0, 0.3, 1.1)
+    ]
+    assert sorted(reads) == [(0, stokes, 1) for stokes in range(4)]
+    assert all(np.array_equal(beam.plane, beams[0].plane) for beam in beams)
+    # Each beam has its own copy, so changing one leaves the kept plane as it was
+    expected = beams[0].plane.copy()
+    beams[0].plane[:] = 0
+    again = load_holography_beam(cube, 0, 9.4e8, frame_rotation_rad=2.0)
+    assert np.array_equal(again.plane, expected)
+    assert len(reads) == 4
+
+
+def test_holography_cube_read_again_once_rewritten(tmp_path: Path) -> None:
+    """A cube written again at the same path is read again, not taken from what was kept of it."""
+    cube = write_holography_cube(
+        tmp_path / "cube.fits", np.array([9.0e8, 9.4e8, 9.8e8])
+    )
+    before = load_holography_beam(cube, 0, 9.4e8, normalise=False)
+    with fits.open(cube, mode="update") as hdul:
+        hdul[0].data *= 2
+    status = cube.stat()
+    os.utime(cube, ns=(status.st_atime_ns, status.st_mtime_ns + 10**9))
+    after = load_holography_beam(cube, 0, 9.4e8, normalise=False)
+    assert np.allclose(after.plane, 2 * before.plane)
+
+
+def test_holography_cube_astropy_reads(tmp_path: Path) -> None:
+    """A cube whose data cannot be read straight from the file, such as float64, gives the same beams through astropy."""
+    cube = flagged_cube(tmp_path / "cube.fits")
+    with fits.open(cube) as hdul:
+        double = tmp_path / "double.fits"
+        fits.writeto(double, hdul[0].data.astype(np.float64), hdul[0].header)
+    for frequency in (8.0e8, 8.123e8):
+        got = load_holography_beam(double, 1, frequency, leakage=True)
+        expected = load_holography_beam(cube, 1, frequency, leakage=True)
+        assert np.array_equal(got.plane, expected.plane)
+        assert np.array_equal(got.leakage, expected.leakage)  # type: ignore[arg-type]
 
 
 @pytest.mark.parametrize("flagged", [False, True])
@@ -512,3 +656,41 @@ def test_beam_numbers_name_the_holography_beams(
         mosaicked("unnumbered", unnamed)
     with pytest.raises(ValueError, match="2 beam numbers for 3 images"):
         mosaicked("short", unnamed, [0, 1])
+
+
+def test_mosaic_logs_its_early_stages(
+    make_image: ImageFactory, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The stages before any tile is made are logged as they start, and timed in the time the mosaic took."""
+    cube = write_holography_cube(
+        tmp_path / "akpb.fits", np.array([FREQUENCY_HZ, 9.5e8]), n_beams=3
+    )
+    options = MosaicOptions(
+        primary_beam=PrimaryBeamOptions(
+            pb_model="holography", holography_cube=cube, pb_cutoff=0.1
+        ),
+        weight=WeightOptions(image_weight="std"),
+    )
+    with caplog.at_level(logging.INFO, logger=logger.name):
+        mosaic(holography_beam_images(make_image), tmp_path / "field", options)
+    messages = [record.message for record in caplog.records]
+    for expected in (
+        "Reading the headers of 3 images",
+        "Reading the holography beams of 3 images, 3 beams of akpb.fits",
+        "Measuring the noise of 3 images",
+    ):
+        assert expected in messages
+    assert any(
+        message.startswith("Measured the noise of 3 images in ") for message in messages
+    )
+    assert any(
+        message.startswith("Wrote ") and " tiles: " in message for message in messages
+    )
+    took = next(message for message in messages if message.startswith("Took "))
+    for stage in (
+        "reading headers",
+        "reading beams",
+        "measuring noise",
+        "making the mosaic",
+    ):
+        assert stage in took

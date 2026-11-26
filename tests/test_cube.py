@@ -40,9 +40,9 @@ from patchwork.plan import check_spectral_axes, group_inputs, output_names
 from patchwork.polarisation import frame_angle
 from patchwork.primary_beam import direction_cosines, gaussian_beam
 from patchwork.tile import PlaneWeight
-from patchwork.weights import measure_channel_weights
+from patchwork.weights import measure_channel_weights, measure_weights
 
-from .conftest import image_header
+from .conftest import image_header, strided_weights
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -650,26 +650,68 @@ def test_measure_channel_weights_in_threads(
 def test_noise_is_measured_with_the_tile_threads(
     beam_cubes: list[dict[str, Path]], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Every backend measures the noise of an image in the threads a tile is made with."""
+    """Every backend measures the noise of the images in the threads a tile is made with, sharing them between the tasks that run at once."""
     threads_used: list[int] = []
+    measured: list[Path] = []
 
-    def recording(path: Path, **kwargs: Any) -> tuple[float, ...]:
+    def recording(paths: list[Path], **kwargs: Any) -> list[tuple[float, ...]]:
         threads_used.append(kwargs["threads"])
-        return measure_channel_weights(path, **kwargs)
+        measured.extend(paths)
+        return measure_weights(paths, **kwargs)
 
-    monkeypatch.setattr(patchwork.mosaic, "measure_channel_weights", recording)
+    monkeypatch.setattr(patchwork.mosaic, "measure_weights", recording)
     # mosaic shares the CPUs between its workers under the name it imported
     monkeypatch.setattr(patchwork.mosaic, "available_cpus", lambda: 12)
     options = cube_options_for_test(
         resample=ResampleOptions(backend="numpy", tile_threads=0, tile_size=64)
-    )
+    )._replace(weight=WeightOptions(image_weight="std"))
     mosaic(
         [cube["i"] for cube in beam_cubes],
         output_base=tmp_path / "threaded",
         options=options,
         max_workers=3,
     )
-    assert threads_used == [4] * len(beam_cubes)
+    assert threads_used == [4] * min(3, len(beam_cubes))
+    assert measured == [cube["i"] for cube in beam_cubes]
+
+
+def test_measure_weights_of_cubes(beam_cubes: list[dict[str, Path]]) -> None:
+    """The channels of cubes are each read whole and measured, to the weights reading every ``stride``'th row alone gives."""
+    paths = [cube[stokes] for cube in beam_cubes for stokes in ("i", "q")]
+    for channels in (None, slice(1, 4)):
+        expected = [strided_weights(path, "mad", 2, channels) for path in paths]
+        for threads in (1, 3):
+            assert (
+                measure_weights(
+                    paths, mode="mad", stride=2, channels=channels, threads=threads
+                )
+                == expected
+            )
+
+
+def test_noise_of_each_image_is_a_task_where_the_capacity_scales(
+    beam_cubes: list[dict[str, Path]], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With a capacity that follows a cluster, each image's noise is a task of its own, so the cluster sees every one waiting."""
+    groups: list[list[Path]] = []
+
+    def recording(paths: list[Path], **kwargs: Any) -> list[tuple[float, ...]]:
+        groups.append(list(paths))
+        return measure_weights(paths, **kwargs)
+
+    monkeypatch.setattr(patchwork.mosaic, "measure_weights", recording)
+    options = cube_options_for_test(
+        resample=ResampleOptions(backend="numpy", tile_size=64)
+    )._replace(weight=WeightOptions(image_weight="std"))
+    with ThreadPoolExecutor(2) as pool:
+        mosaic(
+            [cube["i"] for cube in beam_cubes],
+            output_base=tmp_path / "scaling",
+            options=options,
+            executor=pool,
+            capacity=lambda: 2,
+        )
+    assert sorted(groups) == sorted([cube["i"]] for cube in beam_cubes)
 
 
 zarr_installed = pytest.mark.skipif(

@@ -15,6 +15,7 @@ here, or dask workers through ``patchwork.pipeline.flow``.
 from __future__ import annotations
 
 import functools
+import itertools
 import logging
 import logging.handlers
 import multiprocessing
@@ -41,11 +42,12 @@ from patchwork.convolve import (
     convolve_cube,
     convolved_name,
 )
-from patchwork.io import BeamShape, check_output_fits, read_image_info
+from patchwork.io import BeamShape, ImageInfo, check_output_fits, read_image_info
 from patchwork.logging import logger, setup_logging
 from patchwork.options import (
     ConvolveOptions,
     MosaicOptions,
+    PrimaryBeamOptions,
     RunOptions,
     add_mosaic_options_to_parser,
     create_mosaic_options_from_parser,
@@ -67,7 +69,7 @@ from patchwork.polarisation import STOKES_CODES
 from patchwork.primary_beam import beam_model
 from patchwork.resample import available_cpus, tile_threads
 from patchwork.tile import PlaneWeight
-from patchwork.weights import measure_channel_weights
+from patchwork.weights import measure_weights
 from patchwork.write import (
     _duration,
     bounded_results,
@@ -241,6 +243,12 @@ def mosaic(
                 capacity=capacity,
             )
 
+    # Each stage is timed from here, so the time taken includes reading the inputs' headers and beams
+    stages: list[tuple[str, float]] = []
+    stage_started = time.monotonic()
+    logger.info(
+        f"Reading the headers of {len(images) + len(stokes_i_images or [])} images"
+    )
     infos = [
         read_image_info(
             image, beam_number=None if beam_numbers is None else beam_numbers[index]
@@ -271,11 +279,20 @@ def mosaic(
     ):
         if rotates(item.stokes):
             input_frame_centre(item, options.polarisation)
+    stages.append(("reading headers", time.monotonic() - stage_started))
+    stage_started = time.monotonic()
     # Build each input's primary beam now, so a model that cannot be built fails before any convolving
     leaky = remove_leakage and any(info.stokes != STOKES_CODES["I"] for info in infos)
     if options.weight.weight_type != "weight_image" or leaky:
-        for info in infos:
-            beam_model(options.primary_beam, info, leakage=leaky)
+        _build_beam_models(
+            options.primary_beam,
+            infos,
+            leaky,
+            threads=tile_threads(options.resample.tile_threads),
+        )
+        if options.primary_beam.pb_model == "holography":
+            stages.append(("reading beams", time.monotonic() - stage_started))
+            stage_started = time.monotonic()
     names = output_names(
         output_base,
         tuple(sorted({info.stokes or 0 for info in infos})),
@@ -288,8 +305,6 @@ def mosaic(
     for output in (*names.images, *names.weights, *names.noises):
         check_output_fits(output, overwrite=overwrite, input_fits=originals)
 
-    stages: list[tuple[str, float]] = []
-    stage_started = time.monotonic()
     beams = None
     convolved: list[Path] = []
     if run_options.convolve != "none":
@@ -341,24 +356,45 @@ def mosaic(
         ]
         stokes_i = [read_image_info(path) for path in convolved[n_images:]]
 
+    if plane_weights is None and not needs_image_weight(options.weight, None):
+        plane_weights = [PlaneWeight(values=(1.0,) * info.n_channels) for info in infos]
     if plane_weights is None:
-        measure = needs_image_weight(options.weight, None)
+        # A pool of fixed size runs max_workers tasks at once, so the images are
+        # shared between that many, each measuring its images in the threads a
+        # tile would be made with. Where the capacity follows a cluster as it
+        # scales, each image is a task of its own, so the cluster sees them all
+        n_tasks = (
+            len(infos) if capacity is not None else max(1, min(len(infos), max_workers))
+        )
+        bounds = [len(infos) * task // n_tasks for task in range(n_tasks + 1)]
+        groups = [
+            [info.path for info in infos[first:last]]
+            for first, last in itertools.pairwise(bounds)
+        ]
+        logger.info(
+            f"Measuring the noise of {len(infos)} images"
+            + (f" in {len(groups)} tasks" if len(groups) > 1 else "")
+        )
         plane_weights = [
             PlaneWeight(values=values)
-            for values in _results_in_order(
+            for measured in _results_in_order(
                 executor.submit(
                     _measure_weights,
-                    info.path,
-                    mode=options.weight.image_weight if measure else "none",
+                    group,
+                    mode=options.weight.image_weight,
                     stride=options.weight.weight_stride,
                     channels=channels,
                     threads=options.resample.tile_threads,
                 )
-                for info in infos
+                for group in groups
             )
+            for values in measured
         ]
 
         stages.append(("measuring noise", time.monotonic() - stage_started))
+        logger.info(
+            f"Measured the noise of {len(infos)} images in {_duration(stages[-1][1])}"
+        )
         stage_started = time.monotonic()
 
     inputs = group_inputs(infos, plane_weights, remove_leakage, stokes_i)
@@ -421,20 +457,53 @@ def _convolve_cube(
     )
 
 
+def _build_beam_models(
+    primary_beam: PrimaryBeamOptions,
+    infos: list[ImageInfo],
+    leakage: bool,
+    threads: int,
+) -> None:
+    """Build the primary beam model of each input, so that one that cannot be built fails now, reading the planes of different beams in threads.
+
+    A holography beam's planes are read once and kept, so the inputs that share
+    a beam and frequency, such as its Stokes parameters, are built from them
+    after. One input of each is built first, in threads: threads that missed
+    the same plane at once would each read it.
+    """
+    firsts: dict[tuple[int | None, tuple[float, ...]], ImageInfo] = {}
+    for info in infos:
+        firsts.setdefault((info.beam_number, info.frequencies_hz[:1]), info)
+    if primary_beam.pb_model == "holography":
+        logger.info(
+            f"Reading the holography beams of {len(infos)} images, {len(firsts)} beams "
+            f"of {Path(str(primary_beam.holography_cube)).name}"
+        )
+        if threads > 1 and len(firsts) > 1:
+            with ThreadPoolExecutor(min(threads, len(firsts))) as pool:
+                list(
+                    pool.map(
+                        lambda info: beam_model(primary_beam, info, leakage=leakage),
+                        firsts.values(),
+                    )
+                )
+    for info in infos:
+        beam_model(primary_beam, info, leakage=leakage)
+
+
 def _measure_weights(
-    path: Path,
+    paths: list[Path],
     mode: Literal["mad", "std", "none"],
     stride: int,
     channels: slice | None,
     threads: int,
-) -> tuple[float, ...]:
-    """Measure the weights of a cube's channels in the threads a tile would be made with, with whichever backend.
+) -> list[tuple[float, ...]]:
+    """Measure the weights of the channels of some images or cubes in the threads a tile would be made with, with whichever backend.
 
     Runs where the tiles are made, so ``threads`` of 0 is resolved there: on a
     dask worker, to its CPUs over its threads.
     """
-    return measure_channel_weights(
-        path,
+    return measure_weights(
+        paths,
         mode=mode,
         stride=stride,
         channels=channels,

@@ -119,12 +119,18 @@ and primary beams between channels, so a task over more channels of a smaller
 tile is faster in the same memory: 512² tiles over 16 channels took two thirds
 of the time of 1024² tiles over 4 channels.
 
-For FITS output, every tile passes through the main process on its way to disk,
-and it writes a tile one row of each channel at a time. On a shared file system
-it is then slower than the workers that make the tiles, and they wait for it. On
-a cluster, use `--fits-writer workers` on Lustre or GPFS, or zarr output on any
-file system; both leave the writing to the workers (see
-[pipeline](pipeline.md)). The main process holds no more than
+For FITS output, every tile passes through the main process on its way to disk.
+It gathers the tiles of each band of rows and writes the band whole, holding up
+to `--fits-buffer-mb` of bands (4096 MB by default; see
+[pipeline](pipeline.md)). A band of a cube takes
+`tile_size x frame width x channel_chunk x 4` bytes for each image and weight:
+3.3 GB for 512² tiles over 16 channels of I, Q and U across a frame 20000 pixels
+wide. The default then holds one band at a time, and the tiles of a band that
+starts before it is written are written a row at a time, which is far slower on
+a shared file system, so raise `--fits-buffer-mb` to two or three bands where
+the main process has the memory. On a cluster, use `--fits-writer workers` on
+Lustre or GPFS, or zarr output on any file system; both leave the writing to the
+workers (see [pipeline](pipeline.md)). The main process holds no more than
 `--tasks-in-flight` tiles, by default twice the number of threads making them.
 
 On four threads of a laptop, four beams of I, Q and U, each of 16 channels of

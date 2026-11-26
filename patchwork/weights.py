@@ -9,9 +9,17 @@ from typing import TYPE_CHECKING, Literal
 import numpy as np
 from astropy.stats import mad_std
 
-from patchwork.io import read_block, read_image_info, read_plane
+from patchwork.io import (
+    read_block,
+    read_image_info,
+    read_plane,
+    read_rows,
+    readable_location,
+)
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     from numpy.typing import NDArray
 
 
@@ -58,47 +66,113 @@ def combined_weights(weights: list[NDArray[np.floating]]) -> NDArray[np.float64]
     return np.where(usable, len(weights) / variance, 0.0)
 
 
+NOISE_READ_BYTES = 64 * 2**20
+"""The most bytes of an image read at once to measure its noise"""
+
+
+def _every_row(path: str | Path, channel: int, stride: int) -> NDArray[np.float64]:
+    """Every ``stride``'th row of one channel of an image or cube, from the first, as (y, x).
+
+    Plain float32 data are read whole, in runs of whole rows of up to
+    ``NOISE_READ_BYTES``, and the rows taken from them, as on a file system
+    such as Lustre a read of a few MB takes little longer than one of a single
+    row. Other data are read through astropy.
+    """
+    location = readable_location(path)
+    if location is None:
+        block = read_block(
+            path,
+            region=(slice(None, None, stride), slice(None)),
+            channels=slice(channel, channel + 1),
+        )
+        return np.asarray(block[0], dtype=np.float64)
+    n_rows, n_columns = location.shape[-2:]
+    # A whole number of strides, so each run starts on a row that is kept
+    at_once = max(stride, NOISE_READ_BYTES // (4 * n_columns) // stride * stride)
+    return np.concatenate(
+        [
+            np.asarray(
+                read_rows(
+                    location,
+                    slice(first, min(first + at_once, n_rows)),
+                    channel,
+                    step=stride,
+                ),
+                dtype=np.float64,
+            )
+            for first in range(0, n_rows, at_once)
+        ]
+    )
+
+
+def measure_weights(
+    paths: Sequence[str | Path],
+    mode: Literal["mad", "std", "none"] = "mad",
+    stride: int = 8,
+    channels: slice | None = None,
+    threads: int = 1,
+) -> list[tuple[float, ...]]:
+    """The inverse variance weight of each channel of each of several images or cubes, from every ``stride``'th row, or 1 when ``mode`` is ``none``.
+
+    Only the channels in ``channels`` are measured (by default every channel),
+    and every other channel is given no weight. Each channel of each image is
+    read and measured on its own, ``threads`` at once, so many single-channel
+    images are measured as quickly as the channels of one cube.
+
+    Args:
+        paths (Sequence[str | Path]): The images or cubes
+        mode (Literal["mad", "std", "none"], optional): How the noise is measured: the median absolute deviation, the standard deviation, or not at all. Defaults to "mad".
+        stride (int, optional): Measure every ``stride``'th row. Defaults to 8.
+        channels (slice | None, optional): The channels to measure. Defaults to None, every channel.
+        threads (int, optional): The channels measured at once. Defaults to 1.
+
+    Returns:
+        list[tuple[float, ...]]: The weight of each channel of each image, in the order of ``paths``
+    """
+    counts = [read_image_info(path).n_channels for path in paths]
+    if mode == "none":
+        return [(1.0,) * count for count in counts]
+    planes = [
+        (index, channel)
+        for index, count in enumerate(counts)
+        for channel in range(*(channels or slice(None)).indices(count)[:2])
+    ]
+
+    def measure(plane: tuple[int, int]) -> float:
+        index, channel = plane
+        rows = _every_row(paths[index], channel, stride)
+        return image_noise_weight(rows, mode=mode, stride=1)
+
+    if threads > 1 and len(planes) > 1:
+        with ThreadPoolExecutor(min(threads, len(planes))) as pool:
+            measured = list(pool.map(measure, planes))
+    else:
+        measured = [measure(plane) for plane in planes]
+    weights = [[0.0] * count for count in counts]
+    for (index, channel), weight in zip(planes, measured, strict=True):
+        weights[index][channel] = weight
+    return [tuple(values) for values in weights]
+
+
 def measure_channel_weights(
     path: str | Path,
     mode: Literal["mad", "std", "none"] = "mad",
     stride: int = 8,
-    channel_chunk: int = 16,
+    channel_chunk: int = 16,  # noqa: ARG001
     channels: slice | None = None,
     threads: int = 1,
 ) -> tuple[float, ...]:
     """The inverse variance weight of each channel of a cube, from every ``stride``'th row, or 1 when ``mode`` is ``none``.
 
     Only the channels in ``channels`` are measured (by default every channel),
-    and every other channel is given no weight. The channels are read and
-    measured ``channel_chunk`` at a time, in ``threads`` threads; with more
-    than one, the chunks are made small enough to keep every thread busy.
+    and every other channel is given no weight. The channels are measured as
+    ``measure_weights`` does, ``threads`` at once. ``channel_chunk`` is no
+    longer used, as each channel is read on its own, and is kept so that
+    calls giving it still work.
     """
-    n_channels = read_image_info(path).n_channels
-    if mode == "none":
-        return (1.0,) * n_channels
-    start, stop, _ = (channels or slice(None)).indices(n_channels)
-    weights = [0.0] * n_channels
-    if threads > 1:
-        channel_chunk = max(1, min(channel_chunk, -(-(stop - start) // threads)))
-    chunks = [
-        slice(first, min(first + channel_chunk, stop))
-        for first in range(start, stop, channel_chunk)
-    ]
-
-    def measure(chunk: slice) -> list[float]:
-        block = read_block(
-            path, region=(slice(None, None, stride), slice(None)), channels=chunk
-        )
-        return [image_noise_weight(plane, mode=mode, stride=1) for plane in block]
-
-    if threads > 1 and len(chunks) > 1:
-        with ThreadPoolExecutor(min(threads, len(chunks))) as pool:
-            measured = list(pool.map(measure, chunks))
-    else:
-        measured = [measure(chunk) for chunk in chunks]
-    for chunk, values in zip(chunks, measured, strict=True):
-        weights[chunk] = values
-    return tuple(weights)
+    return measure_weights(
+        [path], mode=mode, stride=stride, channels=channels, threads=threads
+    )[0]
 
 
 def read_weights_log(path: str | Path) -> tuple[float, ...]:

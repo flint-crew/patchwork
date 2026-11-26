@@ -1,19 +1,31 @@
 from __future__ import annotations
 
+import logging
 import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
-from typing import TYPE_CHECKING, Any
+from types import SimpleNamespace
+from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
 import pytest
 from astropy.io import fits
 
-from patchwork.io import create_output_fits, data_location, read_rows, write_rows
-from patchwork.write import _duration, bounded_results, logged_progress
+from patchwork.io import (
+    create_output_fits,
+    data_location,
+    read_rows,
+    write_rows,
+    write_tile_rows,
+)
+from patchwork.logging import logger
+from patchwork.tile import TileResult
+from patchwork.write import _duration, bounded_results, logged_progress, write_tiles
 
 if TYPE_CHECKING:
     from pathlib import Path
+
+    from patchwork.plan import MosaicPlan
 
 
 class Tracker:
@@ -156,6 +168,10 @@ def test_rows_written_in_place(tmp_path: Path, axes: str) -> None:
     assert np.array_equal(data, expected)
     assert path.read_bytes()[: location.offset] == before[: location.offset]
     assert np.array_equal(read_rows(location, slice(2, 5), channels.start), block[0])
+    assert np.array_equal(
+        read_rows(location, slice(1, 7), channels.start, step=2),
+        expected[channels.start, 1:7:2],
+    )
 
     # Blocks that do not fill the rows they are given would write over others
     for rows, channels, shape in (
@@ -194,3 +210,106 @@ def test_neighbouring_strips_written_at_once(tmp_path: Path) -> None:
     data = np.asarray(fits.getdata(path)).reshape(3, 7, 5)
     expected = 10 * np.arange(3)[:, None, None] + np.arange(7)[None, :, None]
     assert np.array_equal(data, np.broadcast_to(expected, (3, 7, 5)))
+
+
+def test_tile_rows_written_in_place(tmp_path: Path) -> None:
+    """Part of some rows is written where astropy finds it, and nothing else in the file changes."""
+    path = create_output_fits(tmp_path / "out.fits", strip_test_header("freq_stokes"))
+    location = data_location(path)
+    block = np.arange(2 * 3 * 2, dtype=np.float32).reshape(2, 3, 2) + 1
+    write_tile_rows(location, (slice(2, 5), slice(1, 3)), slice(1, 3), block)
+    expected = np.zeros((3, 7, 5), dtype=np.float32)
+    expected[1:3, 2:5, 1:3] = block
+    assert np.array_equal(np.asarray(fits.getdata(path)).reshape(3, 7, 5), expected)
+
+    for region, shape in (
+        ((slice(0, 1), slice(0, 2)), (1, 1, 3)),
+        ((slice(0, 1), slice(4, 6)), (1, 1, 2)),
+        ((slice(6, 8), slice(0, 2)), (1, 2, 2)),
+    ):
+        with pytest.raises(ValueError, match="does not fill"):
+            write_tile_rows(location, region, slice(0, 1), np.zeros(shape))
+
+
+def band_test_plan(tmp_path: Path, n_channels: int) -> tuple[MosaicPlan, list[Any]]:
+    """A plan of a mosaic of one image and one weight, 13 x 11 pixels over some channels, in tiles of 4 pixels."""
+    ny, nx, size = 11, 13, 4
+    header = fits.Header()
+    header["NAXIS"] = 3
+    for axis, (ctype, length) in enumerate(
+        (("RA---SIN", nx), ("DEC--SIN", ny), ("FREQ", n_channels)), start=1
+    ):
+        header[f"NAXIS{axis}"] = length
+        header[f"CTYPE{axis}"] = ctype
+    names = SimpleNamespace(
+        images=(create_output_fits(tmp_path / "image.fits", header),),
+        weights=(create_output_fits(tmp_path / "weight.fits", header),),
+        noises=(),
+    )
+    tiles = [
+        (slice(y, min(y + size, ny)), slice(x, min(x + size, nx)))
+        for y in range(0, ny, size)
+        for x in range(0, nx, size)
+    ]
+    plan = SimpleNamespace(
+        names=names,
+        frame=SimpleNamespace(shape=(ny, nx)),
+        tiles=tiles,
+        channels=slice(0, n_channels),
+    )
+    return cast("MosaicPlan", plan), tiles
+
+
+def band_test_results(
+    tiles: list[Any], chunks: list[slice], seed: int = 0
+) -> tuple[list[TileResult], np.ndarray]:
+    """Tiles of random images and weights, over chunks of channels, in a random order, and the whole image and weight they make."""
+    rng = np.random.default_rng(seed)
+    ny = max(tile[0].stop for tile in tiles)
+    nx = max(tile[1].stop for tile in tiles)
+    whole = rng.normal(size=(2, chunks[-1].stop, ny, nx)).astype(np.float32)
+    results = [
+        TileResult(
+            slices=tile,
+            channels=chunk,
+            images=(whole[0][(chunk, *tile)],),
+            weights=(whole[1][(chunk, *tile)],),
+        )
+        for chunk in chunks
+        for tile in tiles
+    ]
+    order = rng.permutation(len(results))
+    return [results[index] for index in order], whole
+
+
+@pytest.mark.parametrize(
+    "buffer_bands",
+    # Every band held, none, or room for one band at a time
+    [100, 0, 1],
+)
+def test_tiles_written_in_bands(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, buffer_bands: int
+) -> None:
+    """Tiles arriving in any order, over chunks of channels, are written where they belong, whether gathered into bands or written a row at a time."""
+    plan, tiles = band_test_plan(tmp_path, n_channels=4)
+    chunks = [slice(0, 2), slice(2, 4)]
+    results, whole = band_test_results(tiles, chunks)
+    # A band is 4 rows of 13 pixels over 2 channels of the image and the weight
+    band_bytes = 4 * 2 * 2 * 4 * 13
+    with caplog.at_level(logging.INFO, logger=logger.name):
+        write_tiles(plan, results, buffer_bytes=buffer_bands * band_bytes)
+    assert np.array_equal(fits.getdata(plan.names.images[0]), whole[0])
+    assert np.array_equal(fits.getdata(plan.names.weights[0]), whole[1])
+    written_by_rows = [
+        record for record in caplog.records if "a row at a time" in record.message
+    ]
+    # Said once, however many bands do not fit
+    assert len(written_by_rows) == (0 if buffer_bands == 100 else 1)
+
+
+def test_unfinished_band_raises(tmp_path: Path) -> None:
+    """Tiles that stop before a band is whole are not quietly left unwritten."""
+    plan, tiles = band_test_plan(tmp_path, n_channels=1)
+    results, _ = band_test_results(tiles, [slice(0, 1)])
+    with pytest.raises(RuntimeError, match="Not every tile"):
+        write_tiles(plan, results[:-1])
