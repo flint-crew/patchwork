@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import importlib.util
 import sys
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
 import pytest
 from astropy.io import fits
 from astropy.wcs import WCS
+from radio_beam import Beams
+from radio_beam.utils import BeamError
 
 from patchwork.convolve import (
     beam_covariance,
@@ -31,6 +33,7 @@ if TYPE_CHECKING:
     from patchwork.convolve import ConvolveBackend
 
 BACKENDS: tuple[ConvolveBackend, ...] = ("scipy", "rust")
+RETRIED_BEAMS: list[BeamShape | None] = [BeamShape(12, 8, 30), BeamShape(10, 10, 0)]
 has_convolve_rs = importlib.util.find_spec("convolve_rs") is not None
 needs_convolve_rs = pytest.mark.skipif(not has_convolve_rs, reason="needs convolve-rs")
 
@@ -158,6 +161,47 @@ def test_common_beam(backend: ConvolveBackend) -> None:
     assert circular.bmin_arcsec == circular.bmaj_arcsec
     with pytest.raises(ValueError, match="usable"):
         common_beam([None, BeamShape(0, 0, 0)], backend=backend)
+
+
+def test_common_beam_retries_with_a_finer_tolerance(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A search that fails is retried once, at a tenth of the tolerance."""
+    tolerances: list[float] = []
+    found = Beams.common_beam
+
+    def first_fails(self: Beams, tolerance: float, **kwargs: Any) -> Any:
+        tolerances.append(tolerance)
+        if len(tolerances) == 1:
+            raise BeamError
+        return found(self, tolerance=tolerance, **kwargs)
+
+    monkeypatch.setattr(Beams, "common_beam", first_fails)
+    assert common_beam(RETRIED_BEAMS, tolerance=1e-4).bmaj_arcsec >= 12
+    assert tolerances == pytest.approx([1e-4, 1e-5])
+    assert "Retrying the common beam search" in caplog.text
+
+
+@needs_convolve_rs
+def test_rust_common_beam_retries_with_a_finer_tolerance(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """convolve-rs is retried the same way."""
+    cr = pytest.importorskip("convolve_rs")
+    tolerances: list[float] = []
+    found = cr.common_beam
+
+    def first_fails(beams: list[Any], tolerance: float, *args: Any) -> Any:
+        tolerances.append(tolerance)
+        if len(tolerances) == 1:
+            raise ValueError
+        return found(beams, tolerance, *args)
+
+    monkeypatch.setattr(cr, "common_beam", first_fails)
+    beam = common_beam(RETRIED_BEAMS, tolerance=1e-4, backend="rust")
+    assert beam.bmaj_arcsec >= 12
+    assert tolerances == pytest.approx([1e-4, 1e-5])
+    assert "Retrying the common beam search" in caplog.text
 
 
 def test_common_beam_says_what_it_left_out(caplog: pytest.LogCaptureFixture) -> None:
