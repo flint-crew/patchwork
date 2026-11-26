@@ -9,10 +9,11 @@ beam areas.
 from __future__ import annotations
 
 import importlib
+import os
 from argparse import ArgumentParser, Namespace
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Any, Literal, get_args
 
 import numpy as np
 import scipy.fft
@@ -37,11 +38,21 @@ from patchwork.logging import logger, setup_logging
 from patchwork.options import ConvolveOptions
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
     from types import ModuleType
 
     from numpy.typing import NDArray
 
 ConvolveBackend = Literal["scipy", "rust"]
+
+NAN_FRACTION = 0.5
+"""A convolved pixel with more than this share of its kernel on missing data is blanked"""
+MISSING_ROUND_OFF = 1e-8
+"""Shares of a kernel below this are taken as none, as the kernel is cut at the same level by its reach"""
+
+
+class NoUsableBeamError(ValueError):
+    """None of the beams a common beam is wanted for is usable."""
 
 
 def convolve_rs() -> ModuleType:
@@ -51,6 +62,37 @@ def convolve_rs() -> ModuleType:
     except ImportError as error:
         msg = "The rust backend needs convolve-rs, which is installed with `pip install askap-patchwork[rust]`"
         raise ImportError(msg) from error
+
+
+def check_backend(backend: str, threads: int | None = None) -> None:
+    """Check that a convolution backend is known, and for ``rust`` that convolve-rs is installed.
+
+    convolve-rs convolves on one pool of threads in each process, made at its
+    first convolution there. ``threads`` sets the size of that pool, through
+    ``RAYON_NUM_THREADS``, unless that is set already: by the user, or by the
+    first call that gave ``threads``.
+
+    Args:
+        backend (str): The backend, ``scipy`` or ``rust``
+        threads (int | None, optional): The threads convolve-rs convolves with in this process. Defaults to None, as many as it can see CPUs, unless set already.
+
+    Raises:
+        ValueError: Raised if the backend is not known
+    """
+    if backend not in get_args(ConvolveBackend):
+        msg = f"Unknown convolution backend {backend!r}, which must be one of {', '.join(get_args(ConvolveBackend))}"
+        raise ValueError(msg)
+    if backend == "rust":
+        if threads is not None:
+            os.environ.setdefault("RAYON_NUM_THREADS", str(threads))
+        convolve_rs()
+
+
+def _rust_beam(cr: ModuleType, beam: BeamShape) -> Any:
+    """A convolve-rs beam, which needs its major axis to be the larger, as a ``BeamShape``'s need not be."""
+    if beam.bmin_arcsec > beam.bmaj_arcsec:
+        beam = BeamShape(beam.bmin_arcsec, beam.bmaj_arcsec, beam.bpa_deg + 90)
+    return cr.Beam.from_arcsec(*beam)
 
 
 def beam_covariance(beam: BeamShape) -> NDArray[np.float64]:
@@ -111,11 +153,13 @@ def common_beam(
         backend (ConvolveBackend, optional): Find the beam with radio_beam (scipy) or with convolve-rs (rust). Defaults to "scipy".
 
     Raises:
-        ValueError: Raised when no beam is usable
+        NoUsableBeamError: Raised when no beam is usable
+        BeamError: Raised when the search fails, even at a tenth of the tolerance
 
     Returns:
         BeamShape: The common beam
     """
+    check_backend(backend)
     usable = [
         beam
         for beam in beams
@@ -125,7 +169,7 @@ def common_beam(
     ]
     if not usable:
         msg = f"None of the {len(beams)} beams is usable"
-        raise ValueError(msg)
+        raise NoUsableBeamError(msg)
 
     if backend == "rust":
         found_shape = _rust_common_beam(usable, tolerance, nsamps, epsilon)
@@ -167,14 +211,17 @@ def common_beam(
 def _rust_common_beam(
     beams: list[BeamShape], tolerance: float, nsamps: int, epsilon: float
 ) -> BeamShape:
-    """The unrounded common beam convolve-rs finds, retried as radio_beam's is."""
+    """The unrounded common beam convolve-rs finds, retried as radio_beam's is, and failing as it does."""
     cr = convolve_rs()
-    rust_beams = [cr.Beam.from_arcsec(*beam) for beam in beams]
+    rust_beams = [_rust_beam(cr, beam) for beam in beams]
     try:
         found = cr.common_beam(rust_beams, tolerance, nsamps, epsilon)
     except ValueError:
         logger.warning(f"Retrying the common beam search with {tolerance=:.1g} / 10")
-        found = cr.common_beam(rust_beams, tolerance * 0.1, nsamps, epsilon)
+        try:
+            found = cr.common_beam(rust_beams, tolerance * 0.1, nsamps, epsilon)
+        except ValueError as error:
+            raise BeamError(str(error)) from error
     return BeamShape(found.major_arcsec, found.minor_arcsec, found.pa_deg)
 
 
@@ -190,7 +237,8 @@ def convolve_to_beam(
 
     The sky beyond the image's edges and under its NaN or infinite pixels is
     missing. Each pixel is divided by the share of its kernel that fell on data,
-    and blanked if more than half fell on missing data.
+    and blanked if more than half fell on missing data. The image's own missing
+    pixels stay blank.
 
     Args:
         image (NDArray[np.floating]): The (y, x) image
@@ -206,6 +254,7 @@ def convolve_to_beam(
     Returns:
         NDArray[np.floating]: The convolved image, in the precision of the input
     """
+    check_backend(backend)
     if cutoff_arcsec is not None and old_beam.bmaj_arcsec > cutoff_arcsec:
         logger.warning(
             f'Blanking an image whose beam, {old_beam}, is larger than {cutoff_arcsec:g}"'
@@ -261,78 +310,162 @@ def convolve_to_beam(
         cr = convolve_rs()
         convolved = cr.smooth(
             data,
-            cr.Beam.from_arcsec(*old_beam),
-            cr.Beam.from_arcsec(*target),
+            _rust_beam(cr, old_beam),
+            _rust_beam(cr, target),
             pixel_scale_matrix=np.asarray(pixel_scale_matrix).tolist(),
             # Jy/beam scales by the areas of the beams passed, so a clipped
             # target is scaled here, by the area of the beam asked for
             bunit="K" if clipped else "Jy/beam",
-            nan_fraction=0.5,
+            nan_fraction=NAN_FRACTION,
         )
         if clipped:
             convolved *= area_ratio
-        if has_missing:
-            logger.info(
-                f"Blanked {np.mean(np.isnan(convolved)):.1%} of the convolved image"
-            )
-        return np.asarray(convolved, dtype=image.dtype)
+    else:
+        ny, nx = image.shape
+        # Zeros out to where the kernel holds under 1e-8 of its weight, 6.1 of
+        # its sigma, make the circular transforms a linear convolution
+        reach = int(np.ceil(6.1 * np.sqrt(np.max(eigenvalues)))) + 1
+        padded = (
+            scipy.fft.next_fast_len(ny + reach, real=True),
+            scipy.fft.next_fast_len(nx + reach, real=True),
+        )
+        # Images can be large, so each plane-sized array is made once and worked
+        # on in place
+        taper = _taper(difference, padded, real_dtype)
+        convolved = _tapered(image, taper, padded, where=finite)
+        convolved *= area_ratio
+        for block, missing in _missing_shares(
+            finite, has_missing, difference, reach, taper, padded
+        ):
+            part = convolved[block]
+            if missing is None:
+                part[...] = np.nan
+                continue
+            blank = missing > NAN_FRACTION
+            # A kernel under a pixel wide rings, so the share can dip below zero
+            divide = ~blank & (np.abs(missing) > MISSING_ROUND_OFF)
+            np.divide(part, 1 - missing, out=part, where=divide)
+            part[blank] = np.nan
 
-    ny, nx = image.shape
-    # Zeros out to where the kernel holds under 1e-8 of its weight, 6.1 of its
-    # sigma, make the circular transforms a linear convolution
-    reach = int(np.ceil(6.1 * np.sqrt(np.max(eigenvalues)))) + 1
-    padded = (
-        scipy.fft.next_fast_len(ny + reach, real=True),
-        scipy.fft.next_fast_len(nx + reach, real=True),
-    )
+    if has_missing:
+        convolved[~finite] = np.nan
+        logger.info(
+            f"Blanked {np.mean(np.isnan(convolved)):.1%} of the convolved image"
+        )
+    return np.asarray(convolved, dtype=image.dtype)
 
-    # Images can be large, so each plane-sized array is made once and worked on
-    # in place. The taper has unit gain, so it also gives the share of each
-    # pixel's kernel that fell on missing data
-    fy = scipy.fft.fftfreq(padded[0]).astype(real_dtype)[:, None]
-    fx = scipy.fft.rfftfreq(padded[1]).astype(real_dtype)[None, :]
-    exponent = (-4 * np.pi**2 * float(difference[0, 1]) * fy) * fx
-    # The Nyquist bin of an even axis holds +1/2 and -1/2 cycles per pixel at
-    # once, so it takes the average of the cross term at both: a cosh
-    nyquist = []
-    if padded[0] % 2 == 0:
-        nyquist.append(exponent[padded[0] // 2, :])
-    if padded[1] % 2 == 0:
-        nyquist.append(exponent[:, -1])
-    for cross in nyquist:
+
+def _taper(
+    difference: NDArray[np.float64],
+    shape: tuple[int, int],
+    real_dtype: type[np.floating],
+) -> NDArray[np.floating]:
+    """The transform of a Gaussian kernel of unit gain, from its covariance in pixels, on the ``rfft2`` grid of an array of ``shape``.
+
+    The Nyquist bin of an even axis holds +1/2 and -1/2 cycles per pixel at
+    once, so its cross term is the average of the cross terms at both, a cosh.
+    Where both axes are even, the corner bin holds all four, and its average is
+    the same cosh, so it too takes it once.
+    """
+    fy = scipy.fft.fftfreq(shape[0]).astype(real_dtype)[:, None]
+    fx = scipy.fft.rfftfreq(shape[1]).astype(real_dtype)[None, :]
+    exponent: NDArray[np.floating] = (-4 * np.pi**2 * float(difference[0, 1]) * fy) * fx
+    row = shape[0] // 2 if shape[0] % 2 == 0 else None
+    crosses = [] if row is None else [exponent[row, :]]
+    if shape[1] % 2 == 0:
+        column = exponent[:, -1]
+        crosses += [column] if row is None else [column[:row], column[row + 1 :]]
+    for cross in crosses:
         cross[...] = np.logaddexp(cross, -cross) - np.log(2)
     exponent -= 2 * np.pi**2 * float(difference[0, 0]) * fx**2
     exponent -= 2 * np.pi**2 * float(difference[1, 1]) * fy**2
-    taper = np.exp(exponent, out=exponent)
+    np.exp(exponent, out=exponent)
+    return exponent
 
-    def tapered(
-        plane: NDArray[np.generic],
-        fill: float = 0.0,
-        where: NDArray[np.bool_] | bool = True,
-    ) -> NDArray[np.floating]:
-        """``plane`` padded with ``fill`` (and zero where not ``where``), multiplied by the taper in the Fourier domain, and cropped."""
-        padded_plane = np.full(padded, fill, dtype=real_dtype)
-        padded_plane[:ny, :nx] = 0
-        np.copyto(padded_plane[:ny, :nx], plane, where=where)
-        spectrum = scipy.fft.rfft2(padded_plane, overwrite_x=True)
-        del padded_plane
-        spectrum *= taper
-        return np.asarray(
-            scipy.fft.irfft2(spectrum, s=padded, overwrite_x=True)[:ny, :nx]
-        )
 
-    missing = tapered(~finite, fill=1.0)
-    convolved = tapered(image, where=finite)
-    convolved *= area_ratio
-    blank = missing > 0.5
-    # A kernel under a pixel wide rings, so the share can dip below zero
-    near = (np.abs(missing) > 1e-8) & ~blank
-    convolved[near] /= 1 - missing[near]
-    convolved[blank] = np.nan
-    if has_missing:
-        logger.info(f"Blanked {np.mean(blank):.1%} of the convolved image")
+def _tapered(
+    plane: NDArray[np.generic],
+    taper: NDArray[np.floating],
+    shape: tuple[int, int],
+    fill: float = 0.0,
+    where: NDArray[np.bool_] | bool = True,
+) -> NDArray[np.floating]:
+    """``plane`` in the corner of an array of ``shape`` filled with ``fill`` (and zero where not ``where``), multiplied by ``taper`` in the Fourier domain, and cropped back to the shape of ``plane``."""
+    ny, nx = plane.shape
+    padded_plane = np.full(shape, fill, dtype=taper.dtype)
+    padded_plane[:ny, :nx] = 0
+    np.copyto(padded_plane[:ny, :nx], plane, where=where)
+    spectrum = scipy.fft.rfft2(padded_plane, overwrite_x=True)
+    del padded_plane
+    spectrum *= taper
+    return np.asarray(scipy.fft.irfft2(spectrum, s=shape, overwrite_x=True)[:ny, :nx])
 
-    return np.asarray(convolved, dtype=image.dtype)
+
+def _missing_shares(
+    finite: NDArray[np.bool_],
+    has_missing: bool,
+    difference: NDArray[np.float64],
+    reach: int,
+    taper: NDArray[np.floating],
+    padded: tuple[int, int],
+    tiled: bool | None = None,
+) -> Iterator[tuple[tuple[slice, slice], NDArray[np.floating] | None]]:
+    """The share of each pixel's kernel that falls on missing data, in the blocks of an image that have any.
+
+    Missing data is the sky beyond the image, and its pixels that are not
+    finite. As in convolve-rs, only the parts of the image within the kernel's
+    reach of it are convolved, in square tiles with a halo of that reach. The
+    share is none away from the blocks given. The whole image is convolved
+    instead where the tiles would not be much smaller than it, or where the
+    kernel is too narrow for its transform to have fallen to nothing at the
+    highest frequencies: such a kernel rings beyond its reach, differently in a
+    tile's transform than in the image's own.
+
+    Args:
+        finite (NDArray[np.bool]): Where the image has data
+        has_missing (bool): Whether any pixel of the image is not finite
+        difference (NDArray[np.float64]): The covariance of the kernel in pixels
+        reach (int): The pixels beyond which the kernel's weight is negligible
+        taper (NDArray[np.floating]): The kernel's transform for the whole image, padded to ``padded``
+        padded (tuple[int, int]): The shape the whole image is padded to
+        tiled (bool | None, optional): Whether to tile the image. Defaults to None, tiling where the tiles are much smaller than the image and the kernel is not too narrow.
+
+    Yields:
+        tuple[tuple[slice, slice], NDArray[np.floating] | None]: A block of the image, and the share of each of its pixels, or None where it is all missing data
+    """
+    ny, nx = finite.shape
+    size = scipy.fft.next_fast_len(max(6 * reach, 128), real=True)
+    if tiled is None:
+        highest = max(np.max(taper[padded[0] // 2]), np.max(taper[:, -1]))
+        tiled = 8 * size <= 2 * min(ny, nx) and highest < MISSING_ROUND_OFF
+    if not tiled:
+        yield (slice(None), slice(None)), _tapered(~finite, taper, padded, fill=1.0)
+        return
+
+    inner = size - 2 * reach
+    tile_taper = _taper(difference, (size, size), taper.dtype.type)
+    for r0 in range(0, ny, inner):
+        for c0 in range(0, nx, inner):
+            # The tile's halo, and the part of it on the image
+            ra, ca = r0 - reach, c0 - reach
+            rows = slice(max(ra, 0), min(ra + size, ny))
+            cols = slice(max(ca, 0), min(ca + size, nx))
+            on_image = finite[rows, cols]
+            if on_image.shape == (size, size) and (not has_missing or on_image.all()):
+                continue
+            block = (slice(r0, min(r0 + inner, ny)), slice(c0, min(c0 + inner, nx)))
+            if has_missing and not on_image.any():
+                yield block, None
+                continue
+            mask = np.ones((size, size), dtype=taper.dtype)
+            mask[
+                rows.start - ra : rows.stop - ra, cols.start - ca : cols.stop - ca
+            ] = ~on_image
+            share = _tapered(mask, tile_taper, (size, size))[
+                reach : reach + block[0].stop - r0, reach : reach + block[1].stop - c0
+            ]
+            if np.any(np.abs(share) > MISSING_ROUND_OFF):
+                yield block, share
 
 
 def convolved_name(path: str | Path, suffix: str = "conv") -> Path:
@@ -418,6 +551,7 @@ def convolve_images(
     Returns:
         tuple[BeamShape, list[Path]]: The beam convolved to, and the convolved images
     """
+    check_backend(options.convolve_backend)
     # Images matched by a pattern can include ones convolved before, so no output may be any input
     for image in images:
         check_output_fits(
@@ -494,7 +628,7 @@ def channel_target_beams(
                 name=name,
                 backend=options.convolve_backend,
             )
-        except ValueError as error:
+        except NoUsableBeamError as error:
             logger.info(f"Leaving {name or 'the images'} blank: {error}")
             return NO_BEAM
 
@@ -550,12 +684,13 @@ def convolve_cube(
         cutoff_arcsec (float | None, optional): Blank channels whose beam major axis is larger than this. Defaults to None.
         overwrite (bool, optional): Replace an existing output. Defaults to False.
         channels (slice | None, optional): The channels to convolve. Defaults to None, every channel.
-        threads (int, optional): Threads that each convolve a channel at a time. Defaults to 1.
+        threads (int, optional): Threads that each convolve a channel at a time. With ``rust``, also the size of convolve-rs's pool of threads in this process, which the channels share, unless that is set already (see ``check_backend``). Defaults to 1.
         backend (ConvolveBackend, optional): Convolve with scipy or with convolve-rs (rust). Defaults to "scipy".
 
     Returns:
         Path: The convolved cube
     """
+    check_backend(backend, threads)
     info = read_image_info(path)
     output_path = Path(output_path)
     check_output_fits(output_path, overwrite=overwrite, input_fits=[path])

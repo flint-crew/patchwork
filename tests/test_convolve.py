@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 import sys
 from typing import TYPE_CHECKING, Any, cast
 
@@ -10,12 +11,17 @@ from astropy.io import fits
 from astropy.wcs import WCS
 from radio_beam import Beams
 from radio_beam.utils import BeamError
+from scipy.fft import next_fast_len
 
 from patchwork.convolve import (
+    _missing_shares,
+    _taper,
     beam_covariance,
     beam_from_covariance,
+    check_backend,
     cli,
     common_beam,
+    convolve_cube,
     convolve_fits,
     convolve_images,
     convolve_to_beam,
@@ -23,7 +29,8 @@ from patchwork.convolve import (
     get_parser,
 )
 from patchwork.io import BeamShape, celestial_wcs
-from patchwork.options import ConvolveOptions
+from patchwork.mosaic import mosaic
+from patchwork.options import ConvolveOptions, RunOptions
 
 from .conftest import image_header
 
@@ -95,13 +102,13 @@ def test_convolve_matches_drawn_beam(
     assert np.max(np.abs(convolved[finite] - expected[finite])) < 1e-4
 
 
-def test_convolve_identity_and_cutoff(backend: ConvolveBackend) -> None:
+def test_convolve_identity_and_cutoff() -> None:
+    """Both backends share these steps, which come before either convolves."""
     wcs = sky_wcs()
     beam = BeamShape(12, 8, 30)
     image = point_sources(wcs, (64, 64), beam)
     assert np.array_equal(
-        convolve_to_beam(image, beam, beam, wcs.pixel_scale_matrix, backend=backend),
-        image,
+        convolve_to_beam(image, beam, beam, wcs.pixel_scale_matrix), image
     )
     assert np.all(
         np.isnan(
@@ -111,18 +118,30 @@ def test_convolve_identity_and_cutoff(backend: ConvolveBackend) -> None:
                 BeamShape(20, 20, 0),
                 wcs.pixel_scale_matrix,
                 cutoff_arcsec=10,
-                backend=backend,
             )
         )
     )
     with pytest.raises(ValueError, match="does not enclose"):
-        convolve_to_beam(
-            image,
-            BeamShape(20, 20, 0),
-            beam,
-            wcs.pixel_scale_matrix,
-            backend=backend,
-        )
+        convolve_to_beam(image, BeamShape(20, 20, 0), beam, wcs.pixel_scale_matrix)
+
+
+def test_convolve_keeps_missing_pixels_blank(backend: ConvolveBackend) -> None:
+    """An input's own NaN and infinite pixels stay blank, even where most of their kernel falls on data."""
+    wcs = sky_wcs()
+    image = point_sources(wcs, (128, 128), BeamShape(12, 8, 30))
+    image[64, 64] = np.nan
+    image[20, 30] = np.inf
+    image[60:100, 100:102] = np.nan
+    convolved = convolve_to_beam(
+        image,
+        BeamShape(12, 8, 30),
+        BeamShape(30, 30, 0),
+        wcs.pixel_scale_matrix,
+        backend=backend,
+    )
+    assert np.array_equal(
+        np.isnan(convolved[10:118, 10:118]), ~np.isfinite(image[10:118, 10:118])
+    )
 
 
 def test_convolve_blanks_around_nans(backend: ConvolveBackend) -> None:
@@ -204,6 +223,22 @@ def test_rust_common_beam_retries_with_a_finer_tolerance(
     assert "Retrying the common beam search" in caplog.text
 
 
+def test_common_beam_search_that_fails_again_stops(
+    monkeypatch: pytest.MonkeyPatch, backend: ConvolveBackend
+) -> None:
+    """A search that fails twice raises BeamError on both backends, rather than a ValueError, which would leave its channel blank."""
+
+    def fails(*_: Any, **__: Any) -> Any:
+        raise BeamError if backend == "scipy" else ValueError
+
+    if backend == "scipy":
+        monkeypatch.setattr(Beams, "common_beam", fails)
+    else:
+        monkeypatch.setattr(pytest.importorskip("convolve_rs"), "common_beam", fails)
+    with pytest.raises(BeamError):
+        common_beam(RETRIED_BEAMS, backend=backend)
+
+
 def test_common_beam_says_what_it_left_out(caplog: pytest.LogCaptureFixture) -> None:
     assert str(BeamShape(11.5, 7.8, -19.24)) == '11.5" x 7.8", PA -19.24 deg'
     beams = [BeamShape(12, 8, 30), None, BeamShape(0, 0, 0), BeamShape(90, 90, 0)]
@@ -283,13 +318,29 @@ def test_convolution_does_not_wrap_around(backend: ConvolveBackend) -> None:
     assert abs(convolved[128, -1]) < 1e-5
 
 
-@pytest.mark.parametrize("new", [BeamShape(40, 30, 20), BeamShape(10.5, 10.3, 0)])
-def test_flat_image_stays_flat(new: BeamShape, backend: ConvolveBackend) -> None:
+@pytest.mark.parametrize("shape", [(100, 120), (700, 760)])
+@pytest.mark.parametrize(
+    "new", [BeamShape(40, 30, 20), BeamShape(20, 18, 30), BeamShape(10.5, 10.3, 0)]
+)
+def test_flat_image_stays_flat(
+    new: BeamShape,
+    shape: tuple[int, int],
+    backend: ConvolveBackend,
+    request: pytest.FixtureRequest,
+) -> None:
     """Pixels near the edges and NaNs are divided by the share of their kernel on
-    data, so a flat image stays flat, even for a kernel under a pixel wide."""
+    data, so a flat image stays flat, even for a kernel under a pixel wide, and
+    where the share is found in tiles (the 20" beam on the larger image)."""
+    if backend == "rust" and new.bmaj_arcsec < 11 and min(shape) > 500:
+        request.applymarker(
+            pytest.mark.xfail(
+                strict=True,
+                reason="convolve-rs 3.0.0 finds the share in tiles even for a kernel under a pixel wide, which rings beyond them",
+            )
+        )
     pixel_scale = np.diag([-2 / 3600, 2 / 3600])
     old = BeamShape(10, 10, 0)
-    image = np.ones((100, 120), dtype=np.float32)
+    image = np.ones(shape, dtype=np.float32)
     image[30:50, 40:70] = np.nan
     convolved = convolve_to_beam(image, old, new, pixel_scale, backend=backend)
     area_ratio = (new.bmaj_arcsec * new.bmin_arcsec) / (
@@ -321,15 +372,19 @@ def test_convolve_refuses_to_write_over_an_input(tmp_path: Path) -> None:
 
 
 @needs_convolve_rs
+@pytest.mark.parametrize("shape", [(200, 230), (600, 650)])
 @pytest.mark.parametrize(
     ("cdelt1_sign", "rotation_deg"), [(-1, 0.0), (1, 0.0), (-1, 25.0)]
 )
-def test_rust_matches_scipy(cdelt1_sign: int, rotation_deg: float) -> None:
+def test_rust_matches_scipy(
+    cdelt1_sign: int, rotation_deg: float, shape: tuple[int, int]
+) -> None:
     """The two backends give the same image and NaN mask, edges included, on
-    any grid, and the same common beam to within its rounding."""
+    any grid and with or without tiles, and the same common beam to within its
+    rounding."""
     wcs = sky_wcs(cdelt1_sign, rotation_deg)
     old, new = BeamShape(12, 8, 30), BeamShape(25, 15, -50)
-    image = point_sources(wcs, (200, 230), old).astype(np.float32)
+    image = point_sources(wcs, shape, old).astype(np.float32)
     image += np.random.default_rng(0).normal(0, 1e-3, image.shape).astype(np.float32)
     image[40:90, 20:70] = np.nan
     image[150, 180] = np.nan
@@ -377,7 +432,10 @@ def test_beam_from_covariance_round_trips() -> None:
             assert (again.bpa_deg - beam.bpa_deg + 90) % 180 - 90 == pytest.approx(0)
 
 
-def test_rust_backend_says_how_to_install(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_rust_backend_says_how_to_install(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A missing convolve-rs is found before anything is read or written."""
     monkeypatch.setitem(sys.modules, "convolve_rs", None)
     wcs = sky_wcs()
     image = np.zeros((32, 32))
@@ -389,3 +447,121 @@ def test_rust_backend_says_how_to_install(monkeypatch: pytest.MonkeyPatch) -> No
             wcs.pixel_scale_matrix,
             backend="rust",
         )
+    path = write_beam_image(tmp_path / "a.fits", BeamShape(12, 8, 30))
+    with pytest.raises(ImportError, match="convolve-rs"):
+        convolve_cube(
+            path, (BeamShape(30, 30, 0),), tmp_path / "a.conv.fits", backend="rust"
+        )
+    with pytest.raises(ImportError, match="convolve-rs"):
+        convolve_images([path], ConvolveOptions(convolve_backend="rust"))
+    assert sorted(path.name for path in tmp_path.iterdir()) == ["a.fits"]
+    # Before the headers are read, so an image that is not there is not noticed
+    with pytest.raises(ImportError, match="convolve-rs"):
+        mosaic(
+            [tmp_path / "missing.fits"],
+            tmp_path / "field",
+            run_options=RunOptions(convolve="natural"),
+            convolve_options=ConvolveOptions(convolve_backend="rust"),
+        )
+
+
+def test_unknown_backend_is_refused() -> None:
+    wcs = sky_wcs()
+    with pytest.raises(ValueError, match="Unknown convolution backend 'Rust'"):
+        convolve_to_beam(
+            np.zeros((32, 32)),
+            BeamShape(10, 10, 0),
+            BeamShape(20, 20, 0),
+            wcs.pixel_scale_matrix,
+            backend="Rust",  # type: ignore[arg-type]
+        )
+    with pytest.raises(ValueError, match="Unknown convolution backend"):
+        common_beam(RETRIED_BEAMS, backend="convolve-rs")  # type: ignore[arg-type]
+
+
+@needs_convolve_rs
+def test_check_backend_sizes_the_rust_threads() -> None:
+    """The first size given is kept, as convolve-rs makes its threads once in a process."""
+    check_backend("scipy", 3)
+    assert "RAYON_NUM_THREADS" not in os.environ
+    check_backend("rust", 3)
+    assert os.environ["RAYON_NUM_THREADS"] == "3"
+    check_backend("rust", 5)
+    assert os.environ["RAYON_NUM_THREADS"] == "3"
+
+
+@needs_convolve_rs
+def test_rust_takes_beams_with_their_axes_swapped() -> None:
+    """A beam whose minor axis is the larger, which convolve-rs refuses, is the same beam with its axes swapped and turned 90 degrees."""
+    wcs = sky_wcs()
+    old, new = BeamShape(8, 12, -60), BeamShape(25, 30, 40)
+    image = point_sources(wcs, (128, 128), BeamShape(12, 8, 30)).astype(np.float32)
+    scipy, rust = (
+        convolve_to_beam(image, old, new, wcs.pixel_scale_matrix, backend=b)
+        for b in BACKENDS
+    )
+    assert np.array_equal(np.isnan(scipy), np.isnan(rust))
+    finite = np.isfinite(scipy)
+    assert np.max(np.abs(scipy[finite] - rust[finite])) < 1e-5
+    found = common_beam([old, BeamShape(10, 10, 0)], backend="rust")
+    assert found.bmaj_arcsec >= 12
+
+
+@needs_convolve_rs
+def test_rust_matches_scipy_for_a_kernel_under_a_pixel() -> None:
+    """A kernel under a pixel wide, with a cross term, reaches the Nyquist bins of the transforms, where both backends take the same cosh."""
+    pixel_scale = np.diag([-2 / 3600, 2 / 3600])
+    old, new = BeamShape(10, 10, 0), BeamShape(10.8, 10.2, 45)
+    image = np.random.default_rng(1).normal(size=(64, 64)).astype(np.float32)
+    scipy, rust = (
+        convolve_to_beam(image, old, new, pixel_scale, backend=b) for b in BACKENDS
+    )
+    finite = np.isfinite(scipy)
+    assert np.array_equal(finite, np.isfinite(rust))
+    assert np.max(np.abs(scipy[finite] - rust[finite])) < 1e-5
+
+
+@pytest.mark.parametrize("shape", [(64, 64), (64, 63), (63, 64)])
+def test_taper_takes_the_nyquist_cross_term_once(shape: tuple[int, int]) -> None:
+    """The Nyquist bins of even axes take the cosh of the cross term, and the corner bin of two takes it once."""
+    difference = np.array([[0.30, 0.18], [0.18, 0.25]])
+    taper = _taper(difference, shape, np.float64)
+    fy = np.fft.fftfreq(shape[0])[:, None]
+    fx = np.fft.rfftfreq(shape[1])[None, :]
+    cross = 4 * np.pi**2 * difference[0, 1] * fy * fx
+    nyquist = np.zeros(taper.shape, dtype=bool)
+    if shape[0] % 2 == 0:
+        nyquist[shape[0] // 2, :] = True
+    if shape[1] % 2 == 0:
+        nyquist[:, -1] = True
+    expected = np.exp(
+        -2 * np.pi**2 * (difference[0, 0] * fx**2 + difference[1, 1] * fy**2)
+    ) * np.where(nyquist, np.cosh(cross), np.exp(-cross))
+    np.testing.assert_allclose(taper, expected, rtol=1e-12)
+
+
+def test_tiled_missing_shares_match_the_whole_image() -> None:
+    """The share of each kernel on missing data is the same found in tiles as over the whole image, and tiles that are all missing are blank."""
+    difference = np.array([[6.0, 1.5], [1.5, 4.0]])
+    reach = int(np.ceil(6.1 * np.sqrt(np.max(np.linalg.eigvalsh(difference))))) + 1
+    finite = np.ones((700, 650), dtype=bool)
+    finite[300:340, 200:260] = False
+    finite[500, 100] = False
+    finite[:200, 400:] = False
+    padded = (
+        next_fast_len(700 + reach, real=True),
+        next_fast_len(650 + reach, real=True),
+    )
+    taper = _taper(difference, padded, np.float64)
+    shares = []
+    all_missing = 0
+    for tiled in (False, True):
+        share = np.zeros(finite.shape)
+        for block, values in _missing_shares(
+            finite, True, difference, reach, taper, padded, tiled=tiled
+        ):
+            all_missing += values is None
+            share[block] = 1.0 if values is None else values
+        shares.append(share)
+    assert all_missing > 0
+    np.testing.assert_allclose(shares[1], shares[0], atol=1e-7)

@@ -44,18 +44,30 @@ missing, and both are treated the same way:
 - A mask of the missing pixels, padding included, is convolved the same way,
   giving the share of each pixel's kernel that fell on missing data. Each pixel
   is divided by the share that fell on data, so a flat image stays flat up to
-  its edges and its NaNs.
+  its edges and its NaNs. The share is found only near missing data, in small
+  tiles, unless the kernel is under about two pixels wide, so an image with no
+  NaNs costs little more than its own transforms.
 - A pixel with more than half of its kernel on missing data is blanked. This
   includes the corners of every image, which have about three quarters of their
   kernel beyond it.
+- The image's own NaN and infinite pixels stay blank, however little of their
+  kernel is missing.
 
-This is how convolve-rs 3 and racs-tools 5 convolve.
+This is how convolve-rs 3 and racs-tools 5 convolve, except that they fill
+isolated missing pixels from their neighbours.
 
 With `--convolve-backend rust` (`ConvolveOptions.convolve_backend`), the
 convolution and the common beam are found with
 [convolve-rs](https://github.com/AlecThomson/convolve-rs) instead, which is
 several times faster on large images. It is installed with
-`pip install askap-patchwork[rust]`. The default is `scipy`.
+`pip install askap-patchwork[rust]`. The default is `scipy`. The two give the
+same images to within rounding, but the common beams they find can differ by a
+step of the rounding below.
+
+convolve-rs convolves each image with several threads, from one pool in each
+process. patchwork sizes that pool from `tile_threads`, times the tasks that run
+at once in the process (patchwork's own threads, or a dask worker's), when it
+first convolves there. Set `RAYON_NUM_THREADS` to size it yourself.
 
 An image whose beam is larger than `beam_cutoff_arcsec` is blanked and given a
 zero beam, as racs-tools does.

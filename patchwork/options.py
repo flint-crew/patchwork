@@ -161,7 +161,7 @@ class ConvolveOptions(BaseOptions):
     suffix: str = "conv"
     """Suffix inserted before ``.fits`` in the names of convolved images"""
     convolve_backend: Literal["scipy", "rust"] = "scipy"
-    """Convolve with scipy, or with convolve-rs, which is installed with ``pip install askap-patchwork[rust]``. Both give the same images and common beams"""
+    """Convolve with scipy, or with convolve-rs, which is faster on large images and is installed with ``pip install askap-patchwork[rust]``. Their images agree to within rounding, but the common beams they find can differ by a step of their rounding (0.1 arcsec, 0.01 deg)"""
 
 
 class RotateOptions(BaseOptions):
