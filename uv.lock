@@ -102,7 +102,7 @@ test = [
 requires-dist = [
     { name = "astropy", specifier = ">=7.2.0" },
     { name = "capn-crunch", specifier = ">=1.2.0" },
-    { name = "convolve-rs", marker = "extra == 'rust'", specifier = ">=3.0.2" },
+    { name = "convolve-rs", marker = "extra == 'rust'", specifier = ">=3.0.3" },
     { name = "dask", extras = ["distributed"], specifier = ">=2025.1.0" },
     { name = "numba", marker = "extra == 'numba'", specifier = ">=0.61" },
     { name = "numpy", specifier = ">=2.0.0" },
@@ -115,7 +115,7 @@ provides-extras = ["numba", "rust", "zarr"]
 
 [package.metadata.requires-dev]
 dev = [
-    { name = "convolve-rs", marker = "(platform_machine == 'arm64' and sys_platform == 'darwin') or (platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')", specifier = ">=3.0.2" },
+    { name = "convolve-rs", marker = "(platform_machine == 'arm64' and sys_platform == 'darwin') or (platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')", specifier = ">=3.0.3" },
     { name = "mypy", specifier = ">=1.19.1" },
     { name = "numba", specifier = ">=0.61" },
     { name = "pre-commit", specifier = ">=4.5.1" },
@@ -136,7 +136,7 @@ docs = [
     { name = "sphinx-copybutton" },
 ]
 test = [
-    { name = "convolve-rs", marker = "(platform_machine == 'arm64' and sys_platform == 'darwin') or (platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')", specifier = ">=3.0.2" },
+    { name = "convolve-rs", marker = "(platform_machine == 'arm64' and sys_platform == 'darwin') or (platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')", specifier = ">=3.0.3" },
     { name = "numba", specifier = ">=0.61" },
     { name = "pytest", specifier = ">=9" },
     { name = "pytest-cov", specifier = ">=7" },
@@ -648,17 +648,17 @@ wheels = [
 
 [[package]]
 name = "convolve-rs"
-version = "3.0.2"
+version = "3.0.3"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
     { name = "numpy", version = "2.5.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/24/85/3d04a1b85884fe77875fd01dc37feec5ed2a99ae0e8db89ac9b791ab04c7/convolve_rs-3.0.2.tar.gz", hash = "sha256:5e9af941f5908deeb74ae2a556c5b108e60c22d0881ba291e42bb8b9c9fcb203", size = 594418, upload-time = "2026-11-27T03:20:14.728Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/4f/25/4c9159dfec108aa837067048df13a788f659447aa1b73efaf14cb2424e8d/convolve_rs-3.0.3.tar.gz", hash = "sha256:585fad6b4450e3ced357ac266c7ed15c6559ccb939cd466ac0c8b6ac657ab80a", size = 594547, upload-time = "2026-11-27T03:50:59.435Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/62/f3/52bd221e2a07c64cfbc3385e76e7329ffae33e19ab6225ee8f0159d3134d/convolve_rs-3.0.2-cp310-abi3-macosx_11_0_arm64.whl", hash = "sha256:e8648d482a01fafa52965f8d7ac6a74d6ad70d56c0176ead875e710e33b06546", size = 1590414, upload-time = "2026-11-27T03:20:10.36Z" },
-    { url = "https://files.pythonhosted.org/packages/db/1c/f485726f67ca785529424fd1fce76b75bacfaedc917162c80163aefab534/convolve_rs-3.0.2-cp310-abi3-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:770b6fff4d7018020a7aee649070d8cb344b429d069a6f4040704a60190dd4cb", size = 1753115, upload-time = "2026-11-27T03:20:11.878Z" },
-    { url = "https://files.pythonhosted.org/packages/05/80/ff691c81a192c7b1f0492f2d68ec23cffb21f7543c099c082ee772726456/convolve_rs-3.0.2-cp310-abi3-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:637d37e2fe37dbde4b48f249a4c27bc94cfa166cfe8eab55bd0f6340a024f2bf", size = 2032482, upload-time = "2026-11-27T03:20:13.417Z" },
+    { url = "https://files.pythonhosted.org/packages/cb/7d/ba766b7fe5591c8cbc817cf0768a7f4614c7796288a700a37629a83f4feb/convolve_rs-3.0.3-cp310-abi3-macosx_11_0_arm64.whl", hash = "sha256:fc77f3d2c4b36f595560bb46f0b986b3600f564dc77ae99f6dd117441586eb6c", size = 1590334, upload-time = "2026-11-27T03:50:55.238Z" },
+    { url = "https://files.pythonhosted.org/packages/cf/c4/6f84f82a8b15e815fcf6f0653894bc138c00c3856877acbed73dc0527e0b/convolve_rs-3.0.3-cp310-abi3-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:dfcc58a2ad6e9fd24ae6d3fffa22c59c7290cdd87f98d1d5b1489f37c8eeb6b0", size = 1753663, upload-time = "2026-11-27T03:50:56.696Z" },
+    { url = "https://files.pythonhosted.org/packages/ea/4d/9c0071fd4f75577b15efc91af7bd956ef8bece2df406e056150b57a20e70/convolve_rs-3.0.3-cp310-abi3-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:f6c40661b7031f71a5a8572da752539e8c6548e479a30e97d825f00cf86ac998", size = 2032503, upload-time = "2026-11-27T03:50:57.959Z" },
 ]
 
 [[package]]
