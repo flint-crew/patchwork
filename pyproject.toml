@@ -40,7 +40,7 @@ dependencies = [
 
 [project.optional-dependencies]
 numba = ["numba>=0.61"]
-rust = ["convolve-rs>=3.0.0"]
+rust = ["convolve-rs>=3.0.2"]
 zarr = ["zarr>=3"]
 
 [project.urls]
@@ -63,7 +63,7 @@ test = [
   "numba>=0.61",
   "zarr>=3",
   # convolve-rs has wheels for these platforms only, and its tests skip without it
-  "convolve-rs>=3.0.0; (sys_platform == 'darwin' and platform_machine == 'arm64') or (sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64'))",
+  "convolve-rs>=3.0.2; (sys_platform == 'darwin' and platform_machine == 'arm64') or (sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64'))",
 ]
 dev = [
     { include-group = "test" },

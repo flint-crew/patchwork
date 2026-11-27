@@ -326,18 +326,10 @@ def test_flat_image_stays_flat(
     new: BeamShape,
     shape: tuple[int, int],
     backend: ConvolveBackend,
-    request: pytest.FixtureRequest,
 ) -> None:
     """Pixels near the edges and NaNs are divided by the share of their kernel on
     data, so a flat image stays flat, even for a kernel under a pixel wide, and
     where the share is found in tiles (the 20" beam on the larger image)."""
-    if backend == "rust" and new.bmaj_arcsec < 11 and min(shape) > 500:
-        request.applymarker(
-            pytest.mark.xfail(
-                strict=True,
-                reason="convolve-rs 3.0.0 finds the share in tiles even for a kernel under a pixel wide, which rings beyond them",
-            )
-        )
     pixel_scale = np.diag([-2 / 3600, 2 / 3600])
     old = BeamShape(10, 10, 0)
     image = np.ones(shape, dtype=np.float32)
