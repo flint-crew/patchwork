@@ -45,7 +45,7 @@ missing, and both are treated the same way:
   giving the share of each pixel's kernel that fell on missing data. Each pixel
   is divided by the share that fell on data, so a flat image stays flat up to
   its edges and its NaNs. The share is found only near missing data, in small
-  tiles, unless the kernel is under about two pixels wide, so an image with no
+  tiles, unless the kernel is under about 1.5 pixels wide, so an image with no
   NaNs costs little more than its own transforms.
 - A pixel with more than half of its kernel on missing data is blanked. This
   includes the corners of every image, which have about three quarters of their

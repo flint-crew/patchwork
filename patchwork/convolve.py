@@ -417,9 +417,9 @@ def _missing_shares(
     reach of it are convolved, in square tiles with a halo of that reach. The
     share is none away from the blocks given. The whole image is convolved
     instead where the tiles would not be much smaller than it, or where the
-    kernel is too narrow for its transform to have fallen to nothing at the
-    highest frequencies: such a kernel rings beyond its reach, differently in a
-    tile's transform than in the image's own.
+    kernel is so narrow that its transform is above 1e-5 at the highest
+    frequencies: such a kernel rings beyond its reach, differently in a tile's
+    transform than in the image's own, by more than that.
 
     Args:
         finite (NDArray[np.bool]): Where the image has data
@@ -437,7 +437,7 @@ def _missing_shares(
     size = scipy.fft.next_fast_len(max(6 * reach, 128), real=True)
     if tiled is None:
         highest = max(np.max(taper[padded[0] // 2]), np.max(taper[:, -1]))
-        tiled = 8 * size <= 2 * min(ny, nx) and highest < MISSING_ROUND_OFF
+        tiled = 8 * size <= 2 * min(ny, nx) and highest < 1e-5
     if not tiled:
         yield (slice(None), slice(None)), _tapered(~finite, taper, padded, fill=1.0)
         return
