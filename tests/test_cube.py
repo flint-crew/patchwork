@@ -49,6 +49,8 @@ if TYPE_CHECKING:
 
     from numpy.typing import NDArray
 
+    from patchwork.convolve import ConvolveBackend
+
 FREQUENCIES = 9.0e8 + 2e7 * np.arange(5)
 IN_BEAM_FRAME = PolarisationOptions(input_frame="crval")
 """The frame ``write_beam_cubes`` references Q and U to"""
@@ -418,8 +420,18 @@ def test_names() -> None:
     assert output_names("base", (0,)).weights[0].name == "base.weight.fits"
 
 
+needs_convolve_rs = pytest.mark.skipif(
+    importlib.util.find_spec("convolve_rs") is None, reason="needs convolve-rs"
+)
+
+
+@pytest.mark.parametrize(
+    "backend", ["scipy", pytest.param("rust", marks=needs_convolve_rs)]
+)
 @pytest.mark.parametrize("mode", ["natural", "total"])
-def test_convolve_to_common_beams(tmp_path: Path, mode: str) -> None:
+def test_convolve_to_common_beams(
+    tmp_path: Path, mode: str, backend: ConvolveBackend
+) -> None:
     beams = [
         write_beam_cubes(
             tmp_path,
@@ -444,6 +456,7 @@ def test_convolve_to_common_beams(tmp_path: Path, mode: str) -> None:
         tmp_path / mode,
         cube_options_for_test(),
         RunOptions(convolve=mode),  # type: ignore[arg-type]
+        ConvolveOptions(convolve_backend=backend),
     )
     info = read_image_info(names.images[0])
     majors = [beam.bmaj_arcsec for beam in info.channel_beams if beam is not None]
@@ -590,6 +603,31 @@ def test_convolve_cube_in_threads(tmp_path: Path) -> None:
     )
     assert info.n_channels == 5
     assert np.all(np.isnan(fits.getdata(threaded)[0, 2]))
+
+
+@needs_convolve_rs
+def test_convolve_cube_rust_matches_scipy(tmp_path: Path) -> None:
+    """A cube convolved by convolve-rs in threads matches scipy's, NaNs and beams included."""
+    cube = write_beam_cubes(
+        tmp_path,
+        "beam00",
+        BEAM_CENTRES[0],
+        size=60,
+        beams=tuple(BeamShape(40 + 5 * channel, 36, 0) for channel in range(5)),
+    )["i"]
+    targets = tuple(
+        BeamShape(70, 70, 0) if channel != 2 else NO_BEAM for channel in range(5)
+    )
+    scipy = convolve_cube(cube, targets, tmp_path / "scipy.fits")
+    rust = convolve_cube(
+        cube, targets, tmp_path / "rust.fits", threads=3, backend="rust"
+    )
+    scipy_data, rust_data = fits.getdata(scipy), fits.getdata(rust)
+    assert np.array_equal(np.isnan(scipy_data), np.isnan(rust_data))
+    finite = np.isfinite(scipy_data)
+    scale = np.max(np.abs(scipy_data[finite]))
+    assert np.max(np.abs(scipy_data[finite] - rust_data[finite])) < 1e-5 * scale
+    assert read_image_info(rust).channel_beams == read_image_info(scipy).channel_beams
 
 
 @pytest.mark.parametrize("channel_chunk", [1, 2, 16])

@@ -155,9 +155,9 @@ convolved in one task, its channels in `tile_threads` threads (each channel's
 FFTs and copies release the GIL). Without these threads, both stages on a single
 worker take as long as every channel done one after another: measuring 36 cubes
 of 32 channels took 12 minutes on one core of a Lustre-backed node, and a
-convolution is two padded FFTs for each channel, four where it has NaNs. A
-convolving thread holds about three padded planes, some 1.2 GB for 10000²
-planes, so give the worker memory for `tile_threads` of them.
+convolution is two padded FFTs for each channel, and small ones near its edges
+and NaNs. A convolving thread holds about three padded planes, some 1.2 GB for
+10000² planes, so give the worker memory for `tile_threads` of them.
 
 With more than one thread, three things happen at once in a tile:
 

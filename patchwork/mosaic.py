@@ -36,7 +36,13 @@ from typing import TYPE_CHECKING, Any, Literal
 
 from capn_crunch import add_options_to_parser, create_options_from_parser
 
-from patchwork.convolve import channel_target_beams, convolve_cube, convolved_name
+from patchwork.convolve import (
+    ConvolveBackend,
+    channel_target_beams,
+    check_backend,
+    convolve_cube,
+    convolved_name,
+)
 from patchwork.io import BeamShape, ImageInfo, check_output_fits, read_image_info
 from patchwork.logging import logger, setup_logging
 from patchwork.options import (
@@ -62,7 +68,7 @@ from patchwork.plan import (
 )
 from patchwork.polarisation import STOKES_CODES
 from patchwork.primary_beam import beam_model
-from patchwork.resample import available_cpus, tile_threads
+from patchwork.resample import _worker_threads, available_cpus, tile_threads
 from patchwork.tile import PlaneWeight
 from patchwork.weights import measure_weights
 from patchwork.write import (
@@ -213,12 +219,21 @@ def mosaic(
     if processes and executor is not None:
         msg = "processes makes patchwork's own pool of processes, so cannot be given with an executor"
         raise ValueError(msg)
+    if run_options.convolve != "none":
+        # Before any file is read, so that a missing convolve-rs is found first
+        check_backend(convolve_options.convolve_backend)
     if executor is None:
         if options.resample.tile_threads == 0:
             # The threads or processes of the pool each make a tile at once, on this machine
             shared = max(1, available_cpus() // max(max_workers, 1))
             options = options._replace(
                 resample=options.resample.model_copy(update={"tile_threads": shared})
+            )
+        if run_options.convolve != "none" and not processes:
+            # The pool's threads share the convolve-rs threads of this process
+            check_backend(
+                convolve_options.convolve_backend,
+                max(max_workers, 1) * tile_threads(options.resample.tile_threads),
             )
         with _own_pool(max_workers, processes) as (pool, pool_share):
             return mosaic(
@@ -329,6 +344,7 @@ def mosaic(
                     overwrite,
                     channels,
                     options.resample.tile_threads,
+                    convolve_options.convolve_backend,
                 ),
             )
             for info, output in zip(to_convolve, outputs, strict=True)
@@ -436,8 +452,12 @@ def _convolve_cube(
     overwrite: bool,
     channels: slice | None,
     threads: int,
+    backend: ConvolveBackend,
 ) -> Path:
     """Convolve a cube in the threads a tile would be made with, resolved where it runs, as ``_measure_weights`` does."""
+    threads = tile_threads(threads)
+    # The tasks a dask worker runs at once share the convolve-rs threads of its process
+    check_backend(backend, threads * _worker_threads())
     return convolve_cube(
         path,
         beams,
@@ -445,7 +465,8 @@ def _convolve_cube(
         cutoff_arcsec,
         overwrite,
         channels,
-        threads=tile_threads(threads),
+        threads=threads,
+        backend=backend,
     )
 
 

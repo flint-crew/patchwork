@@ -60,8 +60,9 @@ From Python, pass a `distributed.Client` to
 ## Workers
 
 Each task uses one core unless `tile_threads` says otherwise: the interpolation
-runs on one thread, and so does the FFT of a convolution. Give the cluster
-single-threaded workers, one for each core, as in the example above.
+runs on one thread, and so does the FFT of a convolution, with either backend
+(see [Convolution](convolution.md)). Give the cluster single-threaded workers,
+one for each core, as in the example above.
 
 - A worker with one thread and many cores, as a cluster set up for wsclean might
   have, runs one task at a time and leaves its other cores idle. There, use the

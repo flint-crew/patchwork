@@ -58,6 +58,13 @@ def image_header(
     return header
 
 
+@pytest.fixture(autouse=True)
+def rayon_threads(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Unset ``RAYON_NUM_THREADS``, which a convolution with convolve-rs sets for the process, and put it back after each test."""
+    monkeypatch.setenv("RAYON_NUM_THREADS", "1")
+    monkeypatch.delenv("RAYON_NUM_THREADS")
+
+
 @pytest.fixture
 def sky_model() -> SkyModel:
     """A smooth sky of a few extended Gaussian sources, as a function of (RA, Dec) in degrees."""
